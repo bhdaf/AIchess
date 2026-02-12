@@ -546,12 +546,13 @@ class ChessGUI:
         btn_text_rect = btn_text.get_rect(center=btn_rect.center)
         screen.blit(btn_text, btn_text_rect)
 
-        # 状态栏
-        status_rect = pygame.Rect(0, board_height - 2, board_width + INFO_WIDTH, 30)
+        # 状态栏（底部叠加）
+        status_y = board_height - 25
+        status_rect = pygame.Rect(0, status_y, board_width + INFO_WIDTH, 25)
         pygame.draw.rect(screen, COLOR_STATUS_BG, status_rect)
         if self.status_text:
             status_surface = self.small_font.render(self.status_text, True, COLOR_STATUS_TEXT)
-            screen.blit(status_surface, (10, board_height + 3))
+            screen.blit(status_surface, (10, status_y + 4))
 
 
 def main():
