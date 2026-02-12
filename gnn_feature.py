@@ -214,16 +214,16 @@ def _build_spatial_adjacency(batch_size, board_planes, device):
                     nidx = ny * BOARD_WIDTH + nx
                     base_adj[idx, nidx] = 1.0
 
-            # 同行连接（距离衰减）
+            # 同行连接（距离衰减，限制距离阈值）
             for nx in range(BOARD_WIDTH):
-                if nx != x:
+                if nx != x and abs(nx - x) <= 4:
                     nidx = y * BOARD_WIDTH + nx
                     dist = abs(nx - x)
                     base_adj[idx, nidx] = max(base_adj[idx, nidx], 1.0 / dist)
 
-            # 同列连接（距离衰减）
+            # 同列连接（距离衰减，限制距离阈值）
             for ny in range(BOARD_HEIGHT):
-                if ny != y:
+                if ny != y and abs(ny - y) <= 5:
                     nidx = ny * BOARD_WIDTH + x
                     dist = abs(ny - y)
                     base_adj[idx, nidx] = max(base_adj[idx, nidx], 1.0 / dist)

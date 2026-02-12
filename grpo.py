@@ -52,7 +52,8 @@ class GRPOTrainer:
         self.optimizer = torch.optim.Adam(
             model.model.parameters(), lr=lr, weight_decay=1e-4
         )
-        self.scaler = torch.amp.GradScaler('cuda') if use_fp16 else None
+        amp_available = use_fp16 and model.device.type == 'cuda'
+        self.scaler = torch.amp.GradScaler('cuda') if amp_available else None
 
     def group_sample(self, policy_logits, legal_mask, group_size=None):
         """
