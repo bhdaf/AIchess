@@ -1,0 +1,513 @@
+"""
+简化中国象棋游戏逻辑
+
+实现完整的中国象棋规则，包括：
+- 棋盘表示（9x10）
+- 所有棋子的移动规则
+- 合法走法生成
+- 胜负判断
+
+坐标系统：
+- x: 列 (0-8)
+- y: 行 (0-9)
+- 红方在下方 (y=0-4)，黑方在上方 (y=5-9)
+
+棋子编码（FEN风格）：
+- 大写=红方: R(车) N(马) B(象) A(仕) K(帅) C(炮) P(兵)
+- 小写=黑方: r(车) n(马) b(象) a(仕) k(将) c(炮) p(卒)
+"""
+
+import numpy as np
+import copy
+
+# 棋子类型索引映射（用于神经网络输入平面）
+PIECE_TO_INDEX = {
+    'P': 0, 'p': 0,  # 兵/卒
+    'C': 1, 'c': 1,  # 炮
+    'R': 2, 'r': 2,  # 车
+    'N': 3, 'n': 3,  # 马
+    'B': 4, 'b': 4,  # 象
+    'A': 5, 'a': 5,  # 仕
+    'K': 6, 'k': 6,  # 帅/将
+}
+
+# 初始棋盘 FEN
+INIT_FEN = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR"
+
+BOARD_HEIGHT = 10
+BOARD_WIDTH = 9
+
+
+def create_action_labels():
+    """
+    创建所有可能走法的标签列表。
+    走法格式: "x0y0x1y1"，其中x为列(0-8)，y为行(0-9)。
+    """
+    labels = []
+    for y1 in range(BOARD_HEIGHT):
+        for x1 in range(BOARD_WIDTH):
+            # 直线走法（车/炮/兵/将等）
+            dests = [(y1, x) for x in range(BOARD_WIDTH)] + \
+                    [(y, x1) for y in range(BOARD_HEIGHT)]
+            # 马的走法
+            dests += [(y1 + dy, x1 + dx) for dy, dx in
+                      [(-2, -1), (-1, -2), (-2, 1), (1, -2),
+                       (2, -1), (-1, 2), (2, 1), (1, 2)]]
+            for y2, x2 in dests:
+                if (y1, x1) != (y2, x2) and 0 <= y2 < BOARD_HEIGHT and 0 <= x2 < BOARD_WIDTH:
+                    labels.append(f"{x1}{y1}{x2}{y2}")
+
+    # 仕的斜线走法（红方）
+    for move in ['3041', '5041', '3241', '5241',
+                 '4130', '4150', '4132', '4152']:
+        if move not in labels:
+            labels.append(move)
+    # 仕的斜线走法（黑方）
+    for move in ['3948', '5948', '3748', '5748',
+                 '4839', '4859', '4837', '4857']:
+        if move not in labels:
+            labels.append(move)
+
+    # 象的斜线走法（红方）
+    for move in ['2002', '2042', '6042', '6082',
+                 '2402', '2442', '6442', '6482',
+                 '0220', '4220', '4260', '8260',
+                 '0224', '4224', '4264', '8264']:
+        if move not in labels:
+            labels.append(move)
+    # 象的斜线走法（黑方）
+    for move in ['2907', '2947', '6947', '6987',
+                 '2507', '2547', '6547', '6587',
+                 '0729', '4729', '4769', '8769',
+                 '0725', '4725', '4765', '8765']:
+        if move not in labels:
+            labels.append(move)
+
+    return labels
+
+
+ACTION_LABELS = create_action_labels()
+LABEL_TO_INDEX = {label: i for i, label in enumerate(ACTION_LABELS)}
+NUM_ACTIONS = len(ACTION_LABELS)
+
+
+def flip_move(move):
+    """翻转走法（用于黑方视角）"""
+    x0, y0, x1, y1 = int(move[0]), int(move[1]), int(move[2]), int(move[3])
+    return f"{8-x0}{9-y0}{8-x1}{9-y1}"
+
+
+def flip_policy(policy):
+    """翻转策略向量（红方视角 <-> 黑方视角）"""
+    flipped = np.zeros_like(policy)
+    for i, label in enumerate(ACTION_LABELS):
+        flipped_label = flip_move(label)
+        if flipped_label in LABEL_TO_INDEX:
+            flipped[LABEL_TO_INDEX[flipped_label]] = policy[i]
+    return flipped
+
+
+class ChessGame:
+    """
+    中国象棋游戏类
+
+    维护棋盘状态，提供走法生成、走子、胜负判断等功能。
+    """
+
+    def __init__(self):
+        self.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        self.red_to_move = True
+        self.winner = None  # 'red', 'black', 'draw', or None
+        self.num_moves = 0
+
+    def reset(self, fen=None):
+        """重置棋盘到初始状态或指定FEN"""
+        if fen is None:
+            fen = INIT_FEN
+        self.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        self._load_fen(fen)
+        self.red_to_move = True
+        self.winner = None
+        self.num_moves = 0
+        return self
+
+    def _load_fen(self, fen):
+        """从FEN字符串加载棋盘
+        
+        FEN的第一行对应棋盘最上方（y=9，黑方底线），
+        最后一行对应棋盘最下方（y=0，红方底线）。
+        """
+        rows = fen.split('/')
+        for i in range(BOARD_HEIGHT):
+            y = BOARD_HEIGHT - 1 - i  # FEN行i -> 棋盘行y
+            x = 0
+            for ch in rows[i]:
+                if ch.isdigit():
+                    x += int(ch)
+                else:
+                    self.board[y][x] = ch
+                    x += 1
+
+    def get_fen(self):
+        """获取当前棋盘的FEN字符串"""
+        rows = []
+        for i in range(BOARD_HEIGHT):
+            y = BOARD_HEIGHT - 1 - i  # 从上到下
+            row_str = ''
+            empty = 0
+            for x in range(BOARD_WIDTH):
+                piece = self.board[y][x]
+                if piece is None:
+                    empty += 1
+                else:
+                    if empty > 0:
+                        row_str += str(empty)
+                        empty = 0
+                    row_str += piece
+            if empty > 0:
+                row_str += str(empty)
+            rows.append(row_str)
+        return '/'.join(rows)
+
+    def get_observation(self):
+        """获取当前玩家视角的观察状态"""
+        if self.red_to_move:
+            return self.get_fen()
+        else:
+            return self._flip_fen(self.get_fen())
+
+    def _flip_fen(self, fen):
+        """翻转FEN（180度旋转 + 大小写互换）"""
+        rows = fen.split('/')
+        flipped_rows = []
+        for row in reversed(rows):
+            flipped_row = ''
+            for ch in reversed(row):
+                if ch.isalpha():
+                    flipped_row += ch.swapcase()
+                else:
+                    flipped_row += ch
+            flipped_rows.append(flipped_row)
+        return '/'.join(flipped_rows)
+
+    def is_red_piece(self, piece):
+        """判断是否为红方棋子"""
+        return piece is not None and piece.isupper()
+
+    def is_black_piece(self, piece):
+        """判断是否为黑方棋子"""
+        return piece is not None and piece.islower()
+
+    def is_own_piece(self, piece):
+        """判断是否为当前方棋子"""
+        if piece is None:
+            return False
+        if self.red_to_move:
+            return piece.isupper()
+        return piece.islower()
+
+    def is_enemy_piece(self, piece):
+        """判断是否为对方棋子"""
+        if piece is None:
+            return False
+        if self.red_to_move:
+            return piece.islower()
+        return piece.isupper()
+
+    def copy(self):
+        """深拷贝当前游戏状态"""
+        return copy.deepcopy(self)
+
+    def get_legal_moves(self):
+        """获取当前方所有合法走法"""
+        moves = []
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                piece = self.board[y][x]
+                if self.is_own_piece(piece):
+                    piece_moves = self._get_piece_moves(x, y, piece)
+                    moves.extend(piece_moves)
+        return moves
+
+    def _get_piece_moves(self, x, y, piece):
+        """获取指定棋子的所有合法走法"""
+        piece_type = piece.upper()
+        if piece_type == 'R':
+            return self._rook_moves(x, y)
+        elif piece_type == 'N':
+            return self._knight_moves(x, y)
+        elif piece_type == 'B':
+            return self._bishop_moves(x, y)
+        elif piece_type == 'A':
+            return self._advisor_moves(x, y)
+        elif piece_type == 'K':
+            return self._king_moves(x, y)
+        elif piece_type == 'C':
+            return self._cannon_moves(x, y)
+        elif piece_type == 'P':
+            return self._pawn_moves(x, y)
+        return []
+
+    def _make_move_str(self, x0, y0, x1, y1):
+        """生成走法字符串"""
+        return f"{x0}{y0}{x1}{y1}"
+
+    def _can_move_to(self, x, y):
+        """检查目标位置是否可以走（空位或对方棋子）"""
+        if not (0 <= x < BOARD_WIDTH and 0 <= y < BOARD_HEIGHT):
+            return False
+        return not self.is_own_piece(self.board[y][x])
+
+    def _rook_moves(self, x, y):
+        """车的走法：直线移动，遇到棋子停止（可吃对方）"""
+        moves = []
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            nx, ny = x + dx, y + dy
+            while 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                target = self.board[ny][nx]
+                if target is None:
+                    moves.append(self._make_move_str(x, y, nx, ny))
+                elif self.is_enemy_piece(target):
+                    moves.append(self._make_move_str(x, y, nx, ny))
+                    break
+                else:
+                    break
+                nx += dx
+                ny += dy
+        return moves
+
+    def _knight_moves(self, x, y):
+        """马的走法：日字形移动，有蹩马腿规则"""
+        moves = []
+        for dx, dy, bx, by in [
+            (-1, -2, 0, -1), (1, -2, 0, -1),
+            (-2, -1, -1, 0), (-2, 1, -1, 0),
+            (-1, 2, 0, 1), (1, 2, 0, 1),
+            (2, -1, 1, 0), (2, 1, 1, 0),
+        ]:
+            nx, ny = x + dx, y + dy
+            block_x, block_y = x + bx, y + by
+            if not (0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT):
+                continue
+            if not (0 <= block_x < BOARD_WIDTH and 0 <= block_y < BOARD_HEIGHT):
+                continue
+            if self.board[block_y][block_x] is not None:
+                continue  # 蹩马腿
+            if self._can_move_to(nx, ny):
+                moves.append(self._make_move_str(x, y, nx, ny))
+        return moves
+
+    def _bishop_moves(self, x, y):
+        """象的走法：斜走两格，不能过河，有塞象眼规则"""
+        moves = []
+        is_red = self.is_red_piece(self.board[y][x])
+        for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
+            nx, ny = x + dx, y + dy
+            bx, by = x + dx // 2, y + dy // 2
+            if not (0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT):
+                continue
+            # 红方象不能过河（y <= 4），黑方象不能过河（y >= 5）
+            if is_red and ny > 4:
+                continue
+            if not is_red and ny < 5:
+                continue
+            if self.board[by][bx] is not None:
+                continue  # 塞象眼
+            if self._can_move_to(nx, ny):
+                moves.append(self._make_move_str(x, y, nx, ny))
+        return moves
+
+    def _advisor_moves(self, x, y):
+        """仕的走法：斜走一格，只能在九宫内"""
+        moves = []
+        is_red = self.is_red_piece(self.board[y][x])
+        for dx, dy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            nx, ny = x + dx, y + dy
+            if not (3 <= nx <= 5):
+                continue
+            if is_red and not (0 <= ny <= 2):
+                continue
+            if not is_red and not (7 <= ny <= 9):
+                continue
+            if self._can_move_to(nx, ny):
+                moves.append(self._make_move_str(x, y, nx, ny))
+        return moves
+
+    def _king_moves(self, x, y):
+        """将/帅的走法：直走一格，只能在九宫内"""
+        moves = []
+        is_red = self.is_red_piece(self.board[y][x])
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            nx, ny = x + dx, y + dy
+            if not (3 <= nx <= 5):
+                continue
+            if is_red and not (0 <= ny <= 2):
+                continue
+            if not is_red and not (7 <= ny <= 9):
+                continue
+            if self._can_move_to(nx, ny):
+                moves.append(self._make_move_str(x, y, nx, ny))
+        return moves
+
+    def _cannon_moves(self, x, y):
+        """炮的走法：直线移动（不吃子时不跳），隔一个棋子吃子"""
+        moves = []
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            nx, ny = x + dx, y + dy
+            jumped = False
+            while 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                target = self.board[ny][nx]
+                if not jumped:
+                    if target is None:
+                        moves.append(self._make_move_str(x, y, nx, ny))
+                    else:
+                        jumped = True  # 找到炮架
+                else:
+                    if target is not None:
+                        if self.is_enemy_piece(target):
+                            moves.append(self._make_move_str(x, y, nx, ny))
+                        break
+                nx += dx
+                ny += dy
+        return moves
+
+    def _pawn_moves(self, x, y):
+        """兵/卒的走法：未过河只能前进，过河后可左右"""
+        moves = []
+        is_red = self.is_red_piece(self.board[y][x])
+
+        if is_red:
+            # 红兵向上走（y增大方向为黑方）
+            forward = (0, 1)
+            crossed_river = y >= 5
+        else:
+            # 黑卒向下走
+            forward = (0, -1)
+            crossed_river = y <= 4
+
+        # 前进
+        nx, ny = x + forward[0], y + forward[1]
+        if 0 <= ny < BOARD_HEIGHT and self._can_move_to(nx, ny):
+            moves.append(self._make_move_str(x, y, nx, ny))
+
+        # 过河后可以横走
+        if crossed_river:
+            for dx in [-1, 1]:
+                nx = x + dx
+                if 0 <= nx < BOARD_WIDTH and self._can_move_to(nx, y):
+                    moves.append(self._make_move_str(x, y, nx, y))
+
+        return moves
+
+    def step(self, action):
+        """
+        执行走法
+
+        Args:
+            action: 走法字符串 "x0y0x1y1"
+
+        Returns:
+            bool: 走法是否成功
+        """
+        x0, y0 = int(action[0]), int(action[1])
+        x1, y1 = int(action[2]), int(action[3])
+
+        captured = self.board[y1][x1]
+        self.board[y1][x1] = self.board[y0][x0]
+        self.board[y0][x0] = None
+        self.num_moves += 1
+
+        # 检查是否吃掉了对方的将/帅
+        if captured is not None and captured.upper() == 'K':
+            self.winner = 'red' if self.red_to_move else 'black'
+
+        # 检查将帅是否面对面
+        if self.winner is None:
+            self._check_king_face()
+
+        self.red_to_move = not self.red_to_move
+
+        # 检查对方是否无子可走
+        if self.winner is None:
+            legal = self.get_legal_moves()
+            if len(legal) == 0:
+                self.winner = 'black' if self.red_to_move else 'red'
+
+        return True
+
+    def _check_king_face(self):
+        """检查将帅是否面对面（飞将）"""
+        red_king = None
+        black_king = None
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                if self.board[y][x] == 'K':
+                    red_king = (x, y)
+                elif self.board[y][x] == 'k':
+                    black_king = (x, y)
+
+        if red_king is None or black_king is None:
+            return
+
+        if red_king[0] != black_king[0]:
+            return
+
+        # 检查两王之间是否有棋子
+        x = red_king[0]
+        min_y = min(red_king[1], black_king[1])
+        max_y = max(red_king[1], black_king[1])
+        for y in range(min_y + 1, max_y):
+            if self.board[y][x] is not None:
+                return
+
+        # 将帅面对面，当前走子方输
+        self.winner = 'black' if self.red_to_move else 'red'
+
+    @property
+    def done(self):
+        return self.winner is not None
+
+    def to_planes(self):
+        """
+        将棋盘转换为14通道的特征平面（当前玩家视角）
+
+        Returns:
+            numpy array, shape (14, 10, 9)
+        """
+        fen = self.get_observation()
+        return fen_to_planes(fen)
+
+    def print_board(self):
+        """打印棋盘到控制台"""
+        print("  0 1 2 3 4 5 6 7 8")
+        for y in range(BOARD_HEIGHT - 1, -1, -1):
+            row = f"{y} "
+            for x in range(BOARD_WIDTH):
+                piece = self.board[y][x]
+                row += (piece if piece else '.') + ' '
+            print(row)
+        print()
+
+
+def fen_to_planes(fen):
+    """
+    将FEN字符串转换为14通道特征平面
+
+    Args:
+        fen: FEN格式的棋盘字符串
+
+    Returns:
+        numpy array, shape (14, 10, 9)
+    """
+    planes = np.zeros((14, BOARD_HEIGHT, BOARD_WIDTH), dtype=np.float32)
+    rows = fen.split('/')
+    for y in range(len(rows)):
+        x = 0
+        for ch in rows[y]:
+            if ch.isdigit():
+                x += int(ch)
+            elif ch.isalpha():
+                idx = PIECE_TO_INDEX[ch] + (7 if ch.islower() else 0)
+                planes[idx][y][x] = 1
+                x += 1
+    return planes
