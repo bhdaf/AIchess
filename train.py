@@ -6,8 +6,15 @@
 2. 训练：用生成的数据训练神经网络
 3. 循环：重复以上步骤持续提升
 
+支持训练模式：
+- 标准训练（原版AlphaZero策略）
+- GRPO训练（Group Relative Policy Optimization）
+- FP16混合精度训练
+
 用法：
     python -m simple_chess_ai.train --num_games 100 --num_epochs 10
+    python -m simple_chess_ai.train --num_games 100 --use_grpo
+    python -m simple_chess_ai.train --num_games 100 --use_fp16
 """
 
 import os
@@ -110,7 +117,8 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
     return training_data, game.winner, move_count
 
 
-def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
+def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
+                use_fp16=False):
     """
     用训练数据训练模型
 
@@ -120,6 +128,7 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
         batch_size: 批大小
         epochs: 训练轮数
         lr: 学习率
+        use_fp16: 是否使用FP16混合精度训练
 
     Returns:
         avg_loss: 平均损失
@@ -143,6 +152,10 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
     model.model.train()
     optimizer = optim.Adam(model.model.parameters(), lr=lr, weight_decay=1e-4)
 
+    # FP16 混合精度
+    amp_enabled = use_fp16 and model.device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda') if amp_enabled else None
+
     total_loss = 0.0
     num_batches = 0
 
@@ -152,21 +165,27 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
             batch_policies = batch_policies.to(model.device)
             batch_values = batch_values.to(model.device)
 
-            # 前向传播
-            pred_policies, pred_values = model.model(batch_states)
+            with torch.amp.autocast('cuda', enabled=amp_enabled):
+                # 前向传播
+                pred_policies, pred_values = model.model(batch_states)
 
-            # 策略损失：交叉熵
-            policy_loss = -torch.mean(
-                torch.sum(batch_policies * torch.log(pred_policies + 1e-8), dim=1)
-            )
-            # 价值损失：均方误差
-            value_loss = torch.mean((batch_values - pred_values.squeeze()) ** 2)
-            # 总损失
-            loss = policy_loss + value_loss
+                # 策略损失：交叉熵
+                policy_loss = -torch.mean(
+                    torch.sum(batch_policies * torch.log(pred_policies + 1e-8), dim=1)
+                )
+                # 价值损失：均方误差
+                value_loss = torch.mean((batch_values - pred_values.squeeze()) ** 2)
+                # 总损失
+                loss = policy_loss + value_loss
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             total_loss += loss.item()
             num_batches += 1
@@ -177,7 +196,8 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
 
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
-                 buffer_size=10000, model_path=None, save_interval=10):
+                 buffer_size=10000, model_path=None, save_interval=10,
+                 use_grpo=False, grpo_group_size=8, use_fp16=False):
     """
     运行完整的训练流程
 
@@ -191,6 +211,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         buffer_size: 训练数据缓冲区大小
         model_path: 模型保存路径
         save_interval: 每隔多少局保存一次模型
+        use_grpo: 是否使用GRPO训练
+        grpo_group_size: GRPO组采样大小
+        use_fp16: 是否使用FP16混合精度训练
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
@@ -204,15 +227,29 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         print("创建新模型")
         model.build()
 
+    # GRPO 训练器
+    grpo_trainer = None
+    if use_grpo:
+        from simple_chess_ai.grpo import GRPOTrainer
+        grpo_trainer = GRPOTrainer(
+            model, group_size=grpo_group_size,
+            lr=lr, use_fp16=use_fp16
+        )
+
     # 训练数据缓冲区
     data_buffer = deque(maxlen=buffer_size)
 
     stats = {'red_wins': 0, 'black_wins': 0, 'draws': 0}
 
+    training_mode = "GRPO" if use_grpo else "Standard"
+    fp16_str = " + FP16" if use_fp16 else ""
+
     print(f"\n{'='*60}")
-    print(f"开始训练")
+    print(f"开始训练 ({training_mode}{fp16_str})")
     print(f"自对弈局数: {num_games}")
     print(f"MCTS模拟次数: {num_simulations}")
+    if use_grpo:
+        print(f"GRPO组大小: {grpo_group_size}")
     print(f"模型保存路径: {model_path}")
     print(f"{'='*60}\n")
 
@@ -243,12 +280,25 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
 
         # 训练（每局都训练，但数据足够时才有效）
         if len(data_buffer) >= batch_size:
-            train_data = list(data_buffer)
-            avg_loss = train_model(
-                model, train_data, batch_size=batch_size,
-                epochs=num_epochs, lr=lr
-            )
-            print(f"  训练完成，平均损失: {avg_loss:.4f}")
+            if use_grpo and grpo_trainer is not None:
+                # GRPO 训练模式
+                from simple_chess_ai.grpo import generate_grpo_training_data
+                grpo_game = ChessGame()
+                grpo_game.reset()
+                grpo_states, grpo_masks = generate_grpo_training_data(
+                    model, grpo_game
+                )
+                grpo_metrics = grpo_trainer.train_step(grpo_states, grpo_masks)
+                print(f"  GRPO训练完成，损失: {grpo_metrics['loss']:.4f}, "
+                      f"策略损失: {grpo_metrics['policy_loss']:.4f}")
+            else:
+                # 标准训练模式
+                train_data = list(data_buffer)
+                avg_loss = train_model(
+                    model, train_data, batch_size=batch_size,
+                    epochs=num_epochs, lr=lr, use_fp16=use_fp16
+                )
+                print(f"  训练完成，平均损失: {avg_loss:.4f}")
 
         # 定期保存模型
         if game_idx % save_interval == 0:
@@ -286,6 +336,12 @@ def main():
                         help='模型保存路径')
     parser.add_argument('--save_interval', type=int, default=10,
                         help='每隔多少局保存模型 (默认: 10)')
+    parser.add_argument('--use_grpo', action='store_true',
+                        help='使用GRPO训练模式')
+    parser.add_argument('--grpo_group_size', type=int, default=8,
+                        help='GRPO组采样大小 (默认: 8)')
+    parser.add_argument('--use_fp16', action='store_true',
+                        help='使用FP16混合精度训练')
 
     args = parser.parse_args()
     run_training(**vars(args))

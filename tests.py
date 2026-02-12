@@ -365,5 +365,197 @@ class TestGameCopy(unittest.TestCase):
         self.assertEqual(copy.board[1][4], 'K')
 
 
+class TestGRPO(unittest.TestCase):
+    """测试GRPO训练器"""
+
+    def setUp(self):
+        self.model = ChessModel(num_channels=32, num_res_blocks=2)
+        self.model.build()
+
+    def test_group_sample(self):
+        """测试组采样机制"""
+        from simple_chess_ai.grpo import GRPOTrainer
+        import torch
+        trainer = GRPOTrainer(self.model, group_size=4)
+        logits = torch.randn(2, NUM_ACTIONS)
+        mask = torch.ones(2, NUM_ACTIONS)
+        actions, log_probs = trainer.group_sample(logits, mask, group_size=4)
+        self.assertEqual(actions.shape, (2, 4))
+        self.assertEqual(log_probs.shape, (2, 4))
+
+    def test_group_advantage(self):
+        """测试组内相对优势计算"""
+        from simple_chess_ai.grpo import GRPOTrainer
+        import torch
+        trainer = GRPOTrainer(self.model, group_size=4)
+        rewards = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+        advantages = trainer.compute_group_advantage(rewards)
+        # 组内归一化后均值应接近0
+        self.assertAlmostEqual(advantages.mean().item(), 0.0, places=5)
+
+    def test_train_step(self):
+        """测试GRPO训练步"""
+        from simple_chess_ai.grpo import GRPOTrainer, generate_grpo_training_data
+        game = ChessGame()
+        game.reset()
+        states, masks = generate_grpo_training_data(self.model, game)
+        trainer = GRPOTrainer(self.model, group_size=4, lr=1e-4)
+        metrics = trainer.train_step(states, masks)
+        self.assertIn('loss', metrics)
+        self.assertIn('policy_loss', metrics)
+        self.assertIn('kl_loss', metrics)
+
+    def test_generate_grpo_data(self):
+        """测试GRPO训练数据生成"""
+        from simple_chess_ai.grpo import generate_grpo_training_data
+        game = ChessGame()
+        game.reset()
+        states, masks = generate_grpo_training_data(self.model, game)
+        self.assertEqual(states.shape[1:], (14, 10, 9))
+        self.assertEqual(masks.shape[1], NUM_ACTIONS)
+        # 合法走法掩码应有非零值
+        self.assertGreater(masks.sum(), 0)
+
+
+class TestGNN(unittest.TestCase):
+    """测试GNN特征提取"""
+
+    def test_build_chess_graph(self):
+        """测试棋盘到图的转换"""
+        from simple_chess_ai.gnn_feature import build_chess_graph
+        import torch
+        planes = torch.randn(2, 14, 10, 9)
+        node_features, adj_matrix = build_chess_graph(planes)
+        self.assertEqual(node_features.shape, (2, 90, 16))
+        self.assertEqual(adj_matrix.shape, (2, 90, 90))
+
+    def test_chess_gnn_forward(self):
+        """测试ChessGNN前向传播"""
+        from simple_chess_ai.gnn_feature import ChessGNN
+        import torch
+        gnn = ChessGNN(node_features=16, hidden_dim=32, output_dim=64, num_heads=4)
+        planes = torch.randn(2, 14, 10, 9)
+        output = gnn(planes)
+        self.assertEqual(output.shape, (2, 64))
+
+    def test_gnn_policy_value_net(self):
+        """测试集成GNN的策略价值网络"""
+        from simple_chess_ai.gnn_feature import GNNPolicyValueNet
+        import torch
+        net = GNNPolicyValueNet(
+            num_channels=32, num_res_blocks=2,
+            gnn_hidden_dim=32, gnn_output_dim=64, num_heads=4
+        )
+        planes = torch.randn(2, 14, 10, 9)
+        policy, value = net(planes)
+        self.assertEqual(policy.shape, (2, NUM_ACTIONS))
+        self.assertEqual(value.shape, (2, 1))
+        # 策略概率应求和为1
+        for i in range(2):
+            self.assertAlmostEqual(policy[i].sum().item(), 1.0, places=4)
+        # 价值应在[-1, 1]范围
+        self.assertTrue(torch.all(value >= -1.0))
+        self.assertTrue(torch.all(value <= 1.0))
+
+    def test_graph_conv_layer(self):
+        """测试图卷积层"""
+        from simple_chess_ai.gnn_feature import GraphConvLayer
+        import torch
+        layer = GraphConvLayer(16, 32)
+        x = torch.randn(2, 10, 16)
+        adj = torch.rand(2, 10, 10)
+        out = layer(x, adj)
+        self.assertEqual(out.shape, (2, 10, 32))
+
+    def test_gat_layer(self):
+        """测试图注意力层"""
+        from simple_chess_ai.gnn_feature import GATLayer
+        import torch
+        layer = GATLayer(16, 32, num_heads=4)
+        x = torch.randn(2, 10, 16)
+        adj = torch.ones(2, 10, 10)
+        out = layer(x, adj)
+        self.assertEqual(out.shape, (2, 10, 32))
+
+
+class TestReasoning(unittest.TestCase):
+    """测试推理模块"""
+
+    def setUp(self):
+        self.model = ChessModel(num_channels=32, num_res_blocks=2)
+        self.model.build()
+        self.game = ChessGame()
+        self.game.reset()
+
+    def test_board_analyzer_threats(self):
+        """测试威胁分析"""
+        from simple_chess_ai.reasoning import BoardAnalyzer
+        threats = BoardAnalyzer.analyze_threats(self.game)
+        self.assertIsInstance(threats, list)
+
+    def test_board_analyzer_position(self):
+        """测试局面评估"""
+        from simple_chess_ai.reasoning import BoardAnalyzer
+        position = BoardAnalyzer.evaluate_position(self.game)
+        self.assertIn('red_material', position)
+        self.assertIn('black_material', position)
+        self.assertIn('material_advantage', position)
+        # 初始局面应该均衡
+        self.assertEqual(position['material_advantage'], 0)
+
+    def test_reasoner_chain(self):
+        """测试推理链生成"""
+        from simple_chess_ai.reasoning import ChessReasoner
+        reasoner = ChessReasoner(self.model)
+        text, features = reasoner.generate_reasoning_chain(self.game)
+        self.assertIsInstance(text, str)
+        self.assertGreater(len(text), 0)
+        self.assertEqual(features.shape, (32,))
+
+    def test_reason_and_act(self):
+        """测试推理并走子"""
+        from simple_chess_ai.reasoning import ChessReasoner
+        reasoner = ChessReasoner(self.model)
+        text, action, policy = reasoner.reason_and_act(self.game)
+        self.assertIsInstance(text, str)
+        self.assertIsInstance(action, str)
+        self.assertEqual(len(action), 4)
+        self.assertEqual(policy.shape, (NUM_ACTIONS,))
+
+    def test_reasoning_reward(self):
+        """测试GRPO推理奖励"""
+        from simple_chess_ai.reasoning import create_grpo_reasoning_reward, ChessReasoner
+        reasoner = ChessReasoner(self.model)
+        reward = create_grpo_reasoning_reward(reasoner, self.game, '4041', 1.0)
+        self.assertIsInstance(reward, float)
+
+    def test_piece_relations(self):
+        """测试棋子关系分析"""
+        from simple_chess_ai.reasoning import BoardAnalyzer
+        relations = BoardAnalyzer.analyze_piece_relations(self.game)
+        self.assertIn('attacks', relations)
+        self.assertIn('defenses', relations)
+
+
+class TestFP16Training(unittest.TestCase):
+    """测试FP16混合精度训练"""
+
+    def test_train_model_fp16_flag(self):
+        """测试train_model接受use_fp16参数"""
+        from simple_chess_ai.train import train_model
+        model = ChessModel(num_channels=32, num_res_blocks=2)
+        model.build()
+        game = ChessGame()
+        game.reset()
+        planes = game.to_planes()
+        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        policy[0] = 1.0
+        data = [(planes, policy, 1.0)]
+        # Should work without errors on CPU (fp16 disabled on CPU)
+        loss = train_model(model, data, batch_size=1, epochs=1,
+                           lr=0.001, use_fp16=False)
+        self.assertIsInstance(loss, float)
+
+
 if __name__ == '__main__':
     unittest.main()
