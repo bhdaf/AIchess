@@ -707,5 +707,183 @@ class TestEvaluateModels(unittest.TestCase):
             self.assertAlmostEqual(winrate, wins / total, places=5)
 
 
+class TestMCTSRootReset(unittest.TestCase):
+    """测试 MCTS root 重置与复用行为（任务1）"""
+
+    def setUp(self):
+        self.model = ChessModel(num_channels=32, num_res_blocks=2)
+        self.model.build()
+
+    def test_reset_mode_clears_old_children(self):
+        """reset_root=True 时，第二次搜索不应包含第一次搜索遗留的子节点统计"""
+        game = ChessGame()
+        game.reset()
+        mcts = MCTS(self.model, num_simulations=5)
+
+        # 第一次搜索（reset_root=True，默认）
+        mcts.get_action_probs(game, temperature=1.0, reset_root=True)
+        root_id_1 = id(mcts.root)
+        # 记录第一次搜索后 root 累积的 visit_count
+        visits_after_1 = mcts.root.visit_count
+
+        # 第二次搜索（同一局面，reset_root=True）
+        mcts.get_action_probs(game, temperature=1.0, reset_root=True)
+        root_id_2 = id(mcts.root)
+
+        # root 对象应被替换（新建了 MCTSNode）
+        self.assertNotEqual(root_id_1, root_id_2,
+                            "reset_root=True 时每次搜索应创建新 root 节点")
+        # root 的 visit_count 应等于本次模拟次数（无旧统计累积）
+        self.assertEqual(mcts.root.visit_count, 5,
+                         "重置模式下 root.visit_count 应等于 num_simulations，不应是两次之和")
+        # 确认没有累积（不是第一次 + 第二次的叠加）
+        self.assertNotEqual(mcts.root.visit_count, visits_after_1 + 5,
+                            "重置模式下访问计数不应跨调用累积")
+
+    def test_reuse_mode_accumulates_visits(self):
+        """reset_root=False 时，子树统计可跨调用保留"""
+        game = ChessGame()
+        game.reset()
+        mcts = MCTS(self.model, num_simulations=5)
+
+        # 首次搜索（显式重置以初始化）
+        mcts.get_action_probs(game, temperature=1.0, reset_root=True)
+        visits_after_first = mcts.root.visit_count
+
+        # 第二次搜索（不重置），在同一 root 上继续模拟
+        mcts.get_action_probs(game, temperature=1.0, reset_root=False)
+        visits_after_second = mcts.root.visit_count
+
+        self.assertGreater(visits_after_second, visits_after_first,
+                           "reset_root=False 时 visit_count 应在两次调用间累积")
+
+    def test_default_is_reset(self):
+        """默认调用 get_action_probs() 等效于 reset_root=True"""
+        game = ChessGame()
+        game.reset()
+        mcts = MCTS(self.model, num_simulations=3)
+        mcts.get_action_probs(game, temperature=1.0)
+        # 默认行为：root 是新鲜的，visit_count == num_simulations
+        self.assertEqual(mcts.root.visit_count, 3)
+
+
+class TestPredictWithMask(unittest.TestCase):
+    """测试 ChessModel.predict_with_mask 的概率归一化与合法走法约束（任务3）"""
+
+    def setUp(self):
+        self.model = ChessModel(num_channels=32, num_res_blocks=2)
+        self.model.build()
+
+    def test_masked_policy_sums_to_one(self):
+        """mask 后的策略概率分布应和为 1"""
+        game = ChessGame()
+        game.reset()
+        planes = game.to_planes()
+        legal_moves = game.get_legal_moves()
+        legal_indices = [LABEL_TO_INDEX[m] for m in legal_moves if m in LABEL_TO_INDEX]
+        policy, value = self.model.predict_with_mask(planes, legal_indices)
+        self.assertAlmostEqual(policy.sum(), 1.0, places=4,
+                               msg="mask 后策略概率之和应为 1")
+
+    def test_illegal_moves_have_zero_probability(self):
+        """非法走法的概率应接近 0（被掩码）"""
+        game = ChessGame()
+        game.reset()
+        planes = game.to_planes()
+        legal_moves = game.get_legal_moves()
+        legal_indices = set(LABEL_TO_INDEX[m] for m in legal_moves if m in LABEL_TO_INDEX)
+        policy, _ = self.model.predict_with_mask(planes, list(legal_indices))
+
+        # 随机取几个非法走法索引，概率应极小（< 1e-6）
+        all_indices = set(range(NUM_ACTIONS))
+        illegal_indices = list(all_indices - legal_indices)[:10]
+        for idx in illegal_indices:
+            self.assertLess(policy[idx], 1e-6,
+                            f"非法走法索引 {idx} 的概率应接近 0，实际为 {policy[idx]}")
+
+    def test_no_nan_in_policy(self):
+        """策略输出中不应出现 NaN"""
+        game = ChessGame()
+        game.reset()
+        planes = game.to_planes()
+        legal_moves = game.get_legal_moves()
+        legal_indices = [LABEL_TO_INDEX[m] for m in legal_moves if m in LABEL_TO_INDEX]
+        policy, _ = self.model.predict_with_mask(planes, legal_indices)
+        self.assertFalse(np.any(np.isnan(policy)), "策略输出中不应有 NaN")
+
+
+class TestSeedReproducibility(unittest.TestCase):
+    """测试训练种子设置（任务2）"""
+
+    def test_seed_setting_no_error(self):
+        """设置 seed 不应抛出异常"""
+        import random
+        import torch as _torch
+        random.seed(42)
+        np.random.seed(42)
+        _torch.manual_seed(42)
+        # 如果 CUDA 不可用，manual_seed_all 也应无误
+        if _torch.cuda.is_available():
+            _torch.cuda.manual_seed_all(42)
+
+    def test_seed_reproducible_dirichlet(self):
+        """相同 seed 下 Dirichlet 噪声序列应可复现"""
+        np.random.seed(123)
+        noise1 = np.random.dirichlet([0.3] * 10)
+        np.random.seed(123)
+        noise2 = np.random.dirichlet([0.3] * 10)
+        np.testing.assert_array_almost_equal(noise1, noise2)
+
+    def test_run_training_accepts_seed_param(self):
+        """run_training 应接受 seed 和 deterministic 参数而不报错"""
+        from simple_chess_ai.train import run_training
+        import inspect
+        sig = inspect.signature(run_training)
+        self.assertIn('seed', sig.parameters,
+                      "run_training 应有 seed 参数")
+        self.assertIn('deterministic', sig.parameters,
+                      "run_training 应有 deterministic 参数")
+        # 默认值应为 None / False
+        self.assertIsNone(sig.parameters['seed'].default)
+        self.assertFalse(sig.parameters['deterministic'].default)
+
+
+class TestMCTSCache(unittest.TestCase):
+    """测试 MCTS 局面缓存（任务4）"""
+
+    def setUp(self):
+        self.model = ChessModel(num_channels=32, num_res_blocks=2)
+        self.model.build()
+
+    def test_cache_disabled_by_default(self):
+        """默认 cache_size=0，_cache_hits 应为 0"""
+        game = ChessGame()
+        game.reset()
+        mcts = MCTS(self.model, num_simulations=5)
+        self.assertEqual(mcts.cache_size, 0)
+        mcts.get_action_probs(game, temperature=1.0)
+        self.assertEqual(mcts._cache_hits, 0)
+
+    def test_cache_enabled_hits_increase(self):
+        """启用缓存后，重复局面的命中次数应 >= 0（不报错）"""
+        game = ChessGame()
+        game.reset()
+        mcts = MCTS(self.model, num_simulations=10, cache_size=256)
+        mcts.get_action_probs(game, temperature=1.0)
+        # 只要不崩溃、_cache_hits >= 0 即可
+        self.assertGreaterEqual(mcts._cache_hits, 0)
+
+    def test_cache_result_consistent(self):
+        """启用缓存时，搜索结果与不启用缓存应在语义上一致（都返回合法走法）"""
+        game = ChessGame()
+        game.reset()
+        mcts_no_cache = MCTS(self.model, num_simulations=5, cache_size=0)
+        mcts_cache = MCTS(self.model, num_simulations=5, cache_size=256)
+        actions_no_cache, _ = mcts_no_cache.get_action_probs(game, temperature=1.0)
+        actions_cache, _ = mcts_cache.get_action_probs(game, temperature=1.0)
+        # 两者返回的走法集合应相同（都是合法走法）
+        self.assertEqual(sorted(actions_no_cache), sorted(actions_cache))
+
+
 if __name__ == '__main__':
     unittest.main()

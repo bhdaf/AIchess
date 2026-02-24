@@ -81,6 +81,12 @@ python -m simple_chess_ai train --gating_interval 0
 # 组合使用
 python -m simple_chess_ai train --use_grpo --use_fp16
 
+# 可复现训练（设置随机种子）
+python -m simple_chess_ai train --seed 42
+
+# 可复现训练 + cuDNN 确定性模式（速度可能降低）
+python -m simple_chess_ai train --seed 42 --deterministic
+
 # 指定模型保存路径
 python -m simple_chess_ai train --model_path my_model.pth
 ```
@@ -103,6 +109,8 @@ python -m simple_chess_ai train --model_path my_model.pth
 | `--gating_interval` | 20 | 每隔多少局进行 gating 评测（0=禁用） |
 | `--gating_games` | 20 | gating 评测对局数 |
 | `--gating_winrate` | 0.55 | gating 接受阈值（新模型胜率需超过此值） |
+| `--seed` | None | 随机种子（设置后可复现数据生成序列） |
+| `--deterministic` | False | 开启 cuDNN 确定性模式（配合 `--seed` 使用，**注意可能降低训练速度**） |
 
 ### 推荐训练参数
 
@@ -156,7 +164,12 @@ python -m simple_chess_ai reason
 ### 神经网络
 - **输入**: 14×10×9 特征平面（7种棋子×2方）
 - **结构**: 初始卷积 → 4个残差块 → 策略头+价值头
-- **策略头**: 输出所有可能走法的概率分布
+- **策略头**: 输出原始 logits（不含 softmax），由调用方按需处理：
+  - `ChessModel.predict()` — 对全体走法做 softmax（向后兼容）
+  - `ChessModel.predict_with_mask(planes, legal_indices)` — 先将非法走法
+    logit 置为极小值（-1e9）再 softmax，使概率质量仅落在合法走法上；
+    MCTS 扩展节点时默认使用此方法
+  - 训练损失使用 `F.log_softmax` + KL 交叉熵，数值更稳定
 - **价值头**: 输出局面评估值 [-1, 1]
 
 ### GNN特征提取（gnn_feature.py）
@@ -181,6 +194,15 @@ python -m simple_chess_ai reason
 - 使用PUCT算法平衡探索与利用
 - 神经网络引导搜索方向
 - 支持温度参数控制探索程度
+- **root 重置 vs 复用**
+  - `reset_root=True`（默认）：每次调用 `get_action_probs()` 前重置 root，
+    保证搜索基于当前局面，无旧统计污染。适合 GUI/CLI/推理场景。
+  - `reset_root=False`（树复用模式）：保留上次子树的访问统计，配合
+    `update_with_move(action)` 手动推进 root，减少重复计算。适合对性能要求
+    高的训练场景（`self_play_game` 默认使用树复用）。
+- **局面缓存**：在 `MCTS` 构造时传入 `cache_size=N`（N>0），单次搜索内遇到
+  相同局面（FEN 相同）时复用网络评估结果，减少重复推理；`cache_size=0`（默认）
+  表示禁用缓存。
 - **训练时**（`add_noise=True`）：在第一次模拟扩展 root 节点后，按 AlphaZero 标准方式
   向 root 的子节点先验概率注入 Dirichlet 噪声：
   `prior = (1 - w) * prior + w * noise`，其中 `w = dirichlet_weight`（默认 0.25）

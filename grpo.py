@@ -133,11 +133,10 @@ class GRPOTrainer:
         device = states.device
 
         # 获取当前策略和价值估计
-        policy, value = model.model(states)
+        policy_logits, value = model.model(states)
 
-        # 用策略概率作为动作质量的代理指标
-        # 高概率动作通常对应更好的收益
-        log_policy = torch.log(policy + 1e-8)
+        # 用策略概率作为动作质量的代理指标；用 log_softmax 数值更稳定
+        log_policy = F.log_softmax(policy_logits, dim=-1)
 
         rewards = torch.zeros(batch_size, group_size, device=device)
         for g in range(group_size):
@@ -171,9 +170,8 @@ class GRPOTrainer:
         amp_enabled = self.use_fp16 and states.device.type == 'cuda'
 
         with torch.amp.autocast('cuda', enabled=amp_enabled):
-            # 1. 获取当前策略 logits
-            policy, value = self.model.model(states)
-            policy_logits = torch.log(policy + 1e-8)
+            # 1. 获取当前策略 logits（forward() 已返回 logits，无需再取 log）
+            policy_logits, value = self.model.model(states)
 
             # 2. 组采样
             sampled_actions, sampled_log_probs = self.group_sample(
@@ -202,9 +200,10 @@ class GRPOTrainer:
                     reduction='batchmean'
                 )
             else:
-                # 无旧策略时使用熵正则化
-                entropy = -(policy * torch.log(policy + 1e-8)).sum(dim=-1).mean()
-                kl_div = -0.01 * entropy  # 鼓励探索
+                # 无旧策略时使用熵正则化（鼓励探索）；复用 log_softmax 避免重复计算
+                log_probs = F.log_softmax(policy_logits, dim=-1)
+                entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
+                kl_div = -0.01 * entropy
 
             total_loss = policy_loss + self.kl_coeff * kl_div
 

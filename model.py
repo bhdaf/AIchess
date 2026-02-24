@@ -13,6 +13,9 @@ import torch.nn.functional as F
 
 from simple_chess_ai.game import NUM_ACTIONS, BOARD_HEIGHT, BOARD_WIDTH
 
+# 非法走法在策略 logits 中被置为此值，使 softmax 后概率接近 0
+_ILLEGAL_LOGIT = -1e9
+
 
 def get_device():
     """获取计算设备"""
@@ -83,10 +86,10 @@ class PolicyValueNet(nn.Module):
         for block in self.res_blocks:
             x = block(x)
 
-        # 策略头
+        # 策略头：输出 logits（不做 softmax，由调用方按需掩码后再归一化）
         p = F.relu(self.policy_bn(self.policy_conv(x)))
         p = p.view(p.size(0), -1)
-        p = F.softmax(self.policy_fc(p), dim=1)
+        p = self.policy_fc(p)
 
         # 价值头
         v = F.relu(self.value_bn(self.value_conv(x)))
@@ -153,12 +156,42 @@ class ChessModel:
             planes: numpy array, shape (14, 10, 9) 或 (batch, 14, 10, 9)
 
         Returns:
-            policy: numpy array, shape (NUM_ACTIONS,)
+            policy: numpy array, shape (NUM_ACTIONS,)，所有走法的概率分布（和为1）
             value: float
         """
         if len(planes.shape) == 3:
             planes = np.expand_dims(planes, 0)
         tensor = torch.FloatTensor(planes).to(self.device)
         with torch.no_grad():
-            policy, value = self.model(tensor)
+            logits, value = self.model(tensor)
+            # 对全体走法做 softmax，保持向后兼容
+            policy = F.softmax(logits, dim=1)
+        return policy.cpu().numpy()[0], value.cpu().numpy()[0][0]
+
+    def predict_with_mask(self, planes, legal_indices):
+        """
+        预测走法概率，先将非法走法 logit 置为极小值再做 softmax。
+
+        相比 predict()，此方法能避免非法走法的概率质量污染合法走法的分布，
+        尤其在合法走法概率很小时效果更稳定。
+
+        Args:
+            planes: numpy array, shape (14, 10, 9)
+            legal_indices: list[int]，合法走法在策略向量中的索引
+
+        Returns:
+            policy: numpy array, shape (NUM_ACTIONS,)，仅合法走法有概率质量
+            value: float
+        """
+        if len(planes.shape) == 3:
+            planes = np.expand_dims(planes, 0)
+        tensor = torch.FloatTensor(planes).to(self.device)
+        with torch.no_grad():
+            logits, value = self.model(tensor)
+            if legal_indices:
+                # 将所有位置的 logit 设为极小值，再把合法走法的 logit 恢复
+                mask = torch.full_like(logits, _ILLEGAL_LOGIT)
+                mask[0, legal_indices] = 0.0
+                logits = logits + mask
+            policy = F.softmax(logits, dim=1)
         return policy.cpu().numpy()[0], value.cpu().numpy()[0][0]

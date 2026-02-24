@@ -228,12 +228,12 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
             batch_values = batch_values.to(model.device)
 
             with torch.amp.autocast('cuda', enabled=amp_enabled):
-                # 前向传播
-                pred_policies, pred_values = model.model(batch_states)
+                # 前向传播；模型输出 logits（策略头不含 softmax）
+                pred_logits, pred_values = model.model(batch_states)
 
-                # 策略损失：交叉熵
+                # 策略损失：交叉熵（用 log_softmax 数值更稳定，避免 log(softmax+eps)）
                 policy_loss = -torch.mean(
-                    torch.sum(batch_policies * torch.log(pred_policies + 1e-8), dim=1)
+                    torch.sum(batch_policies * torch.nn.functional.log_softmax(pred_logits, dim=1), dim=1)
                 )
                 # 价值损失：均方误差
                 value_loss = torch.mean((batch_values - pred_values.squeeze()) ** 2)
@@ -256,11 +256,24 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
     return total_loss / max(num_batches, 1)
 
 
+def _save_training_config(model_path, config):
+    """将训练配置写入 saved_model/config.json，方便复现与追溯。"""
+    import datetime
+    model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
+    os.makedirs(model_dir, exist_ok=True)
+    config['_start_time'] = datetime.datetime.now().isoformat(timespec='seconds')
+    config_path = os.path.join(model_dir, 'config.json')
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    print(f"训练配置已保存到: {config_path}")
+
+
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
                  buffer_size=10000, model_path=None, save_interval=10,
                  use_grpo=False, grpo_group_size=8, use_fp16=False,
-                 gating_interval=20, gating_games=20, gating_winrate=0.55):
+                 gating_interval=20, gating_games=20, gating_winrate=0.55,
+                 seed=None, deterministic=False):
     """
     运行完整的训练流程
 
@@ -280,9 +293,24 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         gating_interval: 每隔多少局进行一次 gating 评测（0 表示禁用）
         gating_games: gating 评测对局数
         gating_winrate: gating 接受阈值（新模型胜率需超过此值）
+        seed: 随机种子（None 表示不固定）
+        deterministic: 是否启用 cuDNN 确定性模式（可能降低训练速度）
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
+
+    # ── 可复现性：设置随机种子 ──────────────────────────────────────────────
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            # 启用 cuDNN 确定性选项；注意可能降低训练速度
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
 
     # 初始化模型
     model = ChessModel(num_channels=128, num_res_blocks=4)
@@ -292,6 +320,18 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     else:
         print("创建新模型")
         model.build()
+
+    # 保存本次训练的配置（供复现/追溯）
+    _save_training_config(model_path, dict(
+        num_games=num_games, num_simulations=num_simulations,
+        num_epochs=num_epochs, batch_size=batch_size, lr=lr,
+        max_moves=max_moves, buffer_size=buffer_size,
+        save_interval=save_interval, use_grpo=use_grpo,
+        grpo_group_size=grpo_group_size, use_fp16=use_fp16,
+        gating_interval=gating_interval, gating_games=gating_games,
+        gating_winrate=gating_winrate, seed=seed,
+        deterministic=deterministic,
+    ))
 
     # 记录基准模型权重（用于 gating 回滚）
     best_model_state = copy.deepcopy(model.model.state_dict())
@@ -447,6 +487,10 @@ def main():
                         help='gating 评测对局数 (默认: 20)')
     parser.add_argument('--gating_winrate', type=float, default=0.55,
                         help='gating 接受阈值，新模型胜率需超过此值 (默认: 0.55)')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='随机种子，设置后可复现数据生成序列 (默认: None)')
+    parser.add_argument('--deterministic', action='store_true',
+                        help='开启 cuDNN 确定性模式（配合 --seed 使用，可能降低训练速度）')
 
     args = parser.parse_args()
     run_training(**vars(args))
