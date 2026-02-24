@@ -65,10 +65,13 @@ class MCTS:
             actions: 走法列表
             probs: 对应的概率列表
         """
-        # 运行模拟
-        for _ in range(self.num_simulations):
+        # 运行模拟；第一次模拟后若需要则向 root 注入 Dirichlet 噪声
+        for i in range(self.num_simulations):
             game_copy = game.copy()
             self._simulate(game_copy, self.root)
+            # 在第一次模拟扩展 root 后注入噪声（仅 root 节点，仅训练时）
+            if i == 0 and add_noise and self.root.children:
+                self._add_dirichlet_noise(self.root)
 
         # 从根节点提取走法概率
         actions = list(self.root.children.keys())
@@ -93,6 +96,16 @@ class MCTS:
                 probs = [1.0 / len(actions)] * len(actions)
 
         return actions, probs
+
+    def _add_dirichlet_noise(self, node):
+        """向节点的子节点先验概率注入 Dirichlet 噪声（仅用于 root 节点）"""
+        children = list(node.children.values())
+        n = len(children)
+        if n == 0:
+            return
+        noise = np.random.dirichlet([self.dirichlet_alpha] * n)
+        for child, eta in zip(children, noise):
+            child.prior = (1 - self.dirichlet_weight) * child.prior + self.dirichlet_weight * eta
 
     def update_with_move(self, action):
         """用选择的走法更新树（复用子树）"""

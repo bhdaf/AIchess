@@ -557,5 +557,155 @@ class TestFP16Training(unittest.TestCase):
         self.assertIsInstance(loss, float)
 
 
+class TestDirichletNoise(unittest.TestCase):
+    """测试 MCTS Dirichlet 噪声注入"""
+
+    def setUp(self):
+        self.model = ChessModel(num_channels=32, num_res_blocks=2)
+        self.model.build()
+
+    def test_noise_changes_priors(self):
+        """add_noise=True 时 root 子节点先验概率应发生变化"""
+        game = ChessGame()
+        game.reset()
+
+        mcts_no_noise = MCTS(self.model, num_simulations=5,
+                             dirichlet_alpha=0.3, dirichlet_weight=0.25)
+        mcts_noise = MCTS(self.model, num_simulations=5,
+                          dirichlet_alpha=0.3, dirichlet_weight=0.25)
+
+        # Run without noise and record priors after expansion
+        mcts_no_noise.get_action_probs(game, temperature=1.0, add_noise=False)
+        priors_no_noise = {a: c.prior
+                           for a, c in mcts_no_noise.root.children.items()}
+
+        # Run with noise and record priors after expansion
+        mcts_noise.get_action_probs(game, temperature=1.0, add_noise=True)
+        priors_noise = {a: c.prior
+                        for a, c in mcts_noise.root.children.items()}
+
+        # With noise, at least some priors should differ from the no-noise run
+        # (they come from the same model, so without noise they'd be the same)
+        common_actions = set(priors_no_noise) & set(priors_noise)
+        self.assertGreater(len(common_actions), 0)
+        diffs = [abs(priors_noise[a] - priors_no_noise[a])
+                 for a in common_actions]
+        # Very high probability that Dirichlet noise changes at least one prior
+        self.assertGreater(max(diffs), 1e-6)
+
+    def test_no_noise_stable(self):
+        """add_noise=False 时两次独立运行结果应相同（相同模型无随机性）"""
+        game = ChessGame()
+        game.reset()
+
+        mcts1 = MCTS(self.model, num_simulations=5)
+        actions1, probs1 = mcts1.get_action_probs(game, temperature=1.0,
+                                                   add_noise=False)
+        mcts2 = MCTS(self.model, num_simulations=5)
+        actions2, probs2 = mcts2.get_action_probs(game, temperature=1.0,
+                                                   add_noise=False)
+        self.assertEqual(sorted(actions1), sorted(actions2))
+
+
+class TestSelfCheckFilter(unittest.TestCase):
+    """测试走后自家被将军的合法性过滤"""
+
+    def test_rook_pin_filtered(self):
+        """车牵制：移走被牵制的子会暴露将"""
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        # 红帅在 (4,0)，被黑车 (4,9) 同列将军中间挡一个红仕 (4,1)
+        game.board[0][4] = 'K'
+        game.board[9][4] = 'k'
+        game.board[1][4] = 'A'   # 红仕在 (4,1) 挡住将
+        game.board[9][0] = 'r'   # 黑车（不在同列，不威胁）
+        game.red_to_move = True
+        moves = game.get_legal_moves()
+        # 仕从 (4,1) 离开会暴露将，所以仕的移动应被过滤掉
+        advisor_moves = [m for m in moves if m[:2] == '41']
+        self.assertEqual(len(advisor_moves), 0,
+                         "被牵制的仕不应有任何走法")
+
+    def test_cannon_check_filtered(self):
+        """炮将：走子暴露炮攻击路线"""
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        # 红帅 (4,0)，黑炮 (4,5)，中间有一个红兵 (4,2) 作炮架
+        # 若红兵移走，黑炮直接攻击红帅 -> 此走法应被过滤
+        game.board[0][4] = 'K'
+        game.board[9][4] = 'k'
+        game.board[2][4] = 'P'   # 红兵（炮架）
+        game.board[5][4] = 'c'   # 黑炮
+        game.red_to_move = True
+        moves = game.get_legal_moves()
+        # 红兵移走会使黑炮直接攻击帅 -> 兵的走法被过滤
+        pawn_moves = [m for m in moves if m[:2] == '42']
+        self.assertEqual(len(pawn_moves), 0,
+                         "移走炮架会暴露将，红兵不应有走法")
+
+    def test_normal_moves_allowed(self):
+        """正常局面下走法不被误过滤"""
+        game = ChessGame()
+        game.reset()
+        moves = game.get_legal_moves()
+        # 初始局面应有 44 步合法走法
+        self.assertEqual(len(moves), 44)
+
+    def test_check_filter_both_sides(self):
+        """黑方也应过滤暴露将的走法"""
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        # 黑将 (4,9)，红车 (4,0) 同列，中间有黑仕 (4,8) 挡住
+        game.board[9][4] = 'k'
+        game.board[0][4] = 'K'
+        game.board[8][4] = 'a'   # 黑仕挡住
+        game.board[0][0] = 'R'   # 红车在 (0,0)
+        game.red_to_move = False
+        moves = game.get_legal_moves()
+        # 黑仕离开会暴露黑将，仕的走法应被过滤
+        advisor_moves = [m for m in moves if m[:2] == '48']
+        self.assertEqual(len(advisor_moves), 0,
+                         "被牵制的黑仕不应有任何走法")
+
+    def test_is_in_check_helper(self):
+        """_is_in_check 辅助函数检测将军"""
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        game.board[0][4] = 'K'
+        game.board[9][4] = 'k'
+        game.board[5][4] = 'r'   # 黑车在同列直接将军红帅
+        game.red_to_move = True
+        self.assertTrue(game._is_in_check(True),
+                        "黑车直接将军时 _is_in_check 应返回 True")
+
+    def test_not_in_check(self):
+        """无将军时 _is_in_check 返回 False"""
+        game = ChessGame()
+        game.reset()
+        self.assertFalse(game._is_in_check(True))
+        self.assertFalse(game._is_in_check(False))
+
+
+class TestEvaluateModels(unittest.TestCase):
+    """测试模型评测函数"""
+
+    def test_evaluate_returns_valid_stats(self):
+        """evaluate_models 返回合法的胜率和统计"""
+        from simple_chess_ai.train import evaluate_models
+        model_a = ChessModel(num_channels=32, num_res_blocks=2)
+        model_a.build()
+        model_b = ChessModel(num_channels=32, num_res_blocks=2)
+        model_b.build()
+        winrate, wins, losses, draws = evaluate_models(
+            model_a, model_b, n_games=4, num_simulations=5, max_moves=50
+        )
+        total = wins + losses + draws
+        self.assertEqual(total, 4)
+        self.assertGreaterEqual(winrate, 0.0)
+        self.assertLessEqual(winrate, 1.0)
+        if total > 0:
+            self.assertAlmostEqual(winrate, wins / total, places=5)
+
+
 if __name__ == '__main__':
     unittest.main()

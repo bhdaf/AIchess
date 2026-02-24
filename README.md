@@ -7,11 +7,13 @@
 - **简化的网络结构**: 128通道、4个残差块（原项目256通道、7个残差块），参数量减少约75%
 - **一体化训练**: 自对弈和训练在同一个脚本中完成，无需分布式协调
 - **图形化界面**: 使用Pygame绘制棋盘和棋子（纯代码绘制，无需外部图片资源）
-- **完整规则**: 支持中国象棋全部规则（蹩马腿、塞象眼、飞将等）
+- **完整规则**: 支持中国象棋全部规则（蹩马腿、塞象眼、飞将等），含走后自家被将军过滤
 - **GRPO训练**: 支持Group Relative Policy Optimization，参考DeepSeek R1思路
 - **GNN特征提取**: 图神经网络建模棋子间攻击/防守关系
 - **推理增强**: Chain-of-Thought思维链推理模块
 - **FP16混合精度**: 支持混合精度训练，降低显存占用
+- **MCTS Dirichlet噪声**: 自对弈训练时向 root 节点注入噪声，增强探索
+- **模型评测门控（Gating）**: 定期对比新旧模型，只有达到胜率阈值才接受更新
 
 ## 项目结构
 
@@ -67,6 +69,15 @@ python -m simple_chess_ai train --use_grpo --grpo_group_size 8
 # 使用FP16混合精度训练（需要CUDA GPU）
 python -m simple_chess_ai train --use_fp16
 
+# 启用 gating（每20局评测，新模型胜率>55%才接受）
+python -m simple_chess_ai train \
+    --gating_interval 20 \
+    --gating_games 20 \
+    --gating_winrate 0.55
+
+# 禁用 gating
+python -m simple_chess_ai train --gating_interval 0
+
 # 组合使用
 python -m simple_chess_ai train --use_grpo --use_fp16
 
@@ -83,10 +94,25 @@ python -m simple_chess_ai train --model_path my_model.pth
 | `--batch_size` | 256 | 训练批大小 |
 | `--lr` | 0.001 | 学习率 |
 | `--max_moves` | 200 | 每局最大步数 |
+| `--buffer_size` | 10000 | 训练数据缓冲区大小 |
 | `--model_path` | 自动 | 模型保存路径 |
+| `--save_interval` | 10 | 每隔多少局保存模型 |
 | `--use_grpo` | False | 使用GRPO训练模式 |
 | `--grpo_group_size` | 8 | GRPO组采样大小 |
 | `--use_fp16` | False | 使用FP16混合精度训练 |
+| `--gating_interval` | 20 | 每隔多少局进行 gating 评测（0=禁用） |
+| `--gating_games` | 20 | gating 评测对局数 |
+| `--gating_winrate` | 0.55 | gating 接受阈值（新模型胜率需超过此值） |
+
+### 推荐训练参数
+
+| 场景 | 推荐参数 | 说明 |
+|------|----------|------|
+| **CPU 快速验证** | `--num_games 50 --num_simulations 50 --gating_interval 0` | 最快完成，用于验证流程 |
+| **CPU 标准训练** | `--num_games 500 --num_simulations 100 --gating_interval 50 --gating_games 10` | 适合4核CPU，每局约60s |
+| **GPU 标准训练** | `--num_games 2000 --num_simulations 200 --num_epochs 10 --gating_interval 50` | RTX 3060推荐配置 |
+| **GPU 强化训练** | `--num_games 5000 --num_simulations 400 --use_fp16 --gating_interval 100 --gating_games 30` | 追求更高棋力 |
+| **GRPO模式** | `--use_grpo --grpo_group_size 8 --num_games 2000 --gating_interval 50` | 更稳定的策略优化 |
 
 ### 2. 图形界面对弈
 
@@ -151,10 +177,28 @@ python -m simple_chess_ai reason
 - 威胁分析、物质评估、走法决策
 - 可通过GRPO强化推理路径准确性
 
-### MCTS搜索
+### MCTS搜索与 Dirichlet 噪声
 - 使用PUCT算法平衡探索与利用
 - 神经网络引导搜索方向
 - 支持温度参数控制探索程度
+- **训练时**（`add_noise=True`）：在第一次模拟扩展 root 节点后，按 AlphaZero 标准方式
+  向 root 的子节点先验概率注入 Dirichlet 噪声：
+  `prior = (1 - w) * prior + w * noise`，其中 `w = dirichlet_weight`（默认 0.25）
+- **评测/对弈时**（`add_noise=False`）：不注入噪声，保证稳定的评测结果
+
+### 走后自家被将军过滤（game.py）
+- `get_legal_moves()` 现在会过滤所有走后导致己方将/帅处于被将军状态的走法
+- 新增辅助方法：`_find_king(for_red)`、`_is_attacked(x, y, for_red)`、
+  `_is_in_check(for_red)`、`_move_leaves_king_in_check(move)`
+- 实现采用"临时执行+还原"策略，避免深拷贝开销
+- 攻击检测涵盖：车、炮、马、兵/卒、飞将（将帅对面）
+
+### 模型评测门控（Gating，train.py）
+- 新增 `evaluate_models(model_a, model_b, n_games, num_simulations)` 函数
+- 每隔 `gating_interval` 局，评测当前候选模型 vs. 基准模型（禁用噪声，temperature=0）
+- 交替红黑方，减少先手优势偏差
+- 若新模型胜率 > `gating_winrate`（默认 55%），接受并更新基准；否则回滚
+- 保存的模型始终是被接受的基准模型
 
 ### FP16混合精度训练
 - 使用`torch.amp.autocast`和`torch.amp.GradScaler`
@@ -162,10 +206,11 @@ python -m simple_chess_ai reason
 - 训练速度提升约30-50%（取决于GPU型号）
 
 ### 训练流程
-1. **自对弈**: 使用当前模型+MCTS生成对局
+1. **自对弈**: 使用当前模型+MCTS生成对局（root 注入 Dirichlet 噪声）
 2. **数据收集**: 记录每步的棋盘状态、搜索概率、最终胜负
 3. **网络训练**: 标准模式或GRPO模式优化
-4. **循环**: 不断生成新数据并训练
+4. **Gating评测**: 每隔 N 局对比候选模型与基准模型，决定是否接受更新
+5. **循环**: 不断生成新数据并训练
 
 ## 预估训练时间和算力开销
 
@@ -201,6 +246,9 @@ python -m simple_chess_ai reason
 | 残差块数 | 7 | 4 |
 | 训练方式 | 分布式（多进程） | 单进程（支持GRPO） |
 | MCTS模拟数 | 800 | 100-200 |
+| Dirichlet噪声 | 有 | 有（已修复，正确注入root） |
+| 走后将军过滤 | 有 | 有（新增） |
+| 模型评测门控 | 有 | 有（新增，可配置阈值） |
 | 图形界面 | 需要图片资源 | 纯代码绘制 |
 | 配置系统 | 复杂（多种模式） | 简化（命令行参数） |
 | GNN特征 | 无 | 支持（GAT） |

@@ -219,15 +219,151 @@ class ChessGame:
         return copy.deepcopy(self)
 
     def get_legal_moves(self):
-        """获取当前方所有合法走法"""
+        """获取当前方所有合法走法（已过滤走后己方被将军的走法）"""
         moves = []
         for y in range(BOARD_HEIGHT):
             for x in range(BOARD_WIDTH):
                 piece = self.board[y][x]
                 if self.is_own_piece(piece):
                     piece_moves = self._get_piece_moves(x, y, piece)
-                    moves.extend(piece_moves)
+                    for move in piece_moves:
+                        if not self._move_leaves_king_in_check(move):
+                            moves.append(move)
         return moves
+
+    def _find_king(self, for_red):
+        """查找将/帅的位置，返回 (x, y) 或 None"""
+        king = 'K' if for_red else 'k'
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                if self.board[y][x] == king:
+                    return (x, y)
+        return None
+
+    def _is_attacked(self, x, y, for_red):
+        """
+        检查位置 (x, y) 是否被对方棋子攻击。
+
+        Args:
+            x, y: 要检查的位置
+            for_red: True 表示检查红方的将/帅是否被黑方攻击
+        """
+        enemy_is_red = not for_red
+
+        # 车攻击：直线，无遮挡
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            nx, ny = x + dx, y + dy
+            while 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                piece = self.board[ny][nx]
+                if piece is not None:
+                    if (enemy_is_red and piece == 'R') or (not enemy_is_red and piece == 'r'):
+                        return True
+                    break
+                nx += dx
+                ny += dy
+
+        # 炮攻击：直线，隔一子
+        for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
+            nx, ny = x + dx, y + dy
+            jumped = False
+            while 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                piece = self.board[ny][nx]
+                if not jumped:
+                    if piece is not None:
+                        jumped = True
+                else:
+                    if piece is not None:
+                        if (enemy_is_red and piece == 'C') or (not enemy_is_red and piece == 'c'):
+                            return True
+                        break
+                nx += dx
+                ny += dy
+
+        # 马攻击：反向推导哪些马能攻击 (x, y)
+        for dx, dy, bx, by in [
+            (-1, -2, 0, -1), (1, -2, 0, -1),
+            (-2, -1, -1, 0), (-2, 1, -1, 0),
+            (-1, 2, 0, 1), (1, 2, 0, 1),
+            (2, -1, 1, 0), (2, 1, 1, 0),
+        ]:
+            nx, ny = x - dx, y - dy  # 马所在位置
+            block_x, block_y = nx + bx, ny + by  # 蹩马腿位置
+            if not (0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT):
+                continue
+            if not (0 <= block_x < BOARD_WIDTH and 0 <= block_y < BOARD_HEIGHT):
+                continue
+            if self.board[block_y][block_x] is not None:
+                continue  # 蹩马腿，无法攻击
+            piece = self.board[ny][nx]
+            if (enemy_is_red and piece == 'N') or (not enemy_is_red and piece == 'n'):
+                return True
+
+        # 兵/卒攻击
+        if for_red:
+            # 黑卒攻击红方：黑卒向下走（y减小），过河后可横走
+            # 黑卒在 (x, y+1) 可向下攻击 (x, y)（无论是否过河）
+            # 黑卒在 (x±1, y) 且已过河（ny <= 4）可横向攻击 (x, y)
+            for check_x, check_y in [(x, y + 1), (x + 1, y), (x - 1, y)]:
+                if 0 <= check_x < BOARD_WIDTH and 0 <= check_y < BOARD_HEIGHT:
+                    piece = self.board[check_y][check_x]
+                    if piece == 'p':
+                        if check_y == y + 1:  # 黑卒在上方，向下攻击
+                            return True
+                        elif check_y == y and check_y <= 4:  # 黑卒过河后横向攻击
+                            return True
+        else:
+            # 红兵攻击黑方：红兵向上走（y增大），过河后可横走
+            for check_x, check_y in [(x, y - 1), (x + 1, y), (x - 1, y)]:
+                if 0 <= check_x < BOARD_WIDTH and 0 <= check_y < BOARD_HEIGHT:
+                    piece = self.board[check_y][check_x]
+                    if piece == 'P':
+                        if check_y == y - 1:  # 红兵在下方，向上攻击
+                            return True
+                        elif check_y == y and check_y >= 5:  # 红兵过河后横向攻击
+                            return True
+
+        # 飞将：将帅同列且中间无棋子
+        enemy_king = 'k' if for_red else 'K'
+        for dy in [1, -1]:
+            ny = y + dy
+            while 0 <= ny < BOARD_HEIGHT:
+                piece = self.board[ny][x]
+                if piece is not None:
+                    if piece == enemy_king:
+                        return True
+                    break
+                ny += dy
+
+        return False
+
+    def _is_in_check(self, for_red):
+        """检查指定方的将/帅是否处于被将状态"""
+        king_pos = self._find_king(for_red)
+        if king_pos is None:
+            return True  # 将/帅不存在，视为被将
+        return self._is_attacked(king_pos[0], king_pos[1], for_red)
+
+    def _move_leaves_king_in_check(self, move):
+        """
+        检查执行走法后己方将/帅是否处于被将状态。
+        通过临时修改棋盘并还原来避免深拷贝，提高性能。
+        """
+        x0, y0 = int(move[0]), int(move[1])
+        x1, y1 = int(move[2]), int(move[3])
+
+        # 临时执行走法
+        captured = self.board[y1][x1]
+        self.board[y1][x1] = self.board[y0][x0]
+        self.board[y0][x0] = None
+
+        # 检查己方是否被将
+        in_check = self._is_in_check(self.red_to_move)
+
+        # 撤销走法
+        self.board[y0][x0] = self.board[y1][x1]
+        self.board[y1][x1] = captured
+
+        return in_check
 
     def _get_piece_moves(self, x, y, piece):
         """获取指定棋子的所有合法走法"""

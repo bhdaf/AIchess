@@ -20,6 +20,7 @@
 import os
 import json
 import time
+import copy
 import argparse
 import numpy as np
 from collections import deque
@@ -40,6 +41,67 @@ from simple_chess_ai.mcts import MCTS
 DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(__file__), 'saved_model')
 DEFAULT_MODEL_PATH = os.path.join(DEFAULT_MODEL_DIR, 'model.pth')
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), 'train_data')
+
+
+def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=200):
+    """
+    通过对局评测两个模型，返回 model_a 的胜率。
+
+    对弈时禁用 Dirichlet 噪声，使用温度=0 的确定性走法，
+    并交替红黑方以减少先手优势偏差。
+
+    Args:
+        model_a: 候选新模型
+        model_b: 基准模型
+        n_games: 对局数
+        num_simulations: MCTS模拟次数
+        max_moves: 每局最大步数
+
+    Returns:
+        (winrate_a, wins_a, wins_b, draws)
+    """
+    wins_a = 0
+    wins_b = 0
+    draws = 0
+
+    for game_idx in range(n_games):
+        # 交替先手以减少先手优势偏差
+        if game_idx % 2 == 0:
+            red_model, black_model = model_a, model_b
+            a_is_red = True
+        else:
+            red_model, black_model = model_b, model_a
+            a_is_red = False
+
+        game = ChessGame()
+        game.reset()
+        mcts_red = MCTS(red_model, num_simulations=num_simulations)
+        mcts_black = MCTS(black_model, num_simulations=num_simulations)
+
+        move_count = 0
+        while not game.done and move_count < max_moves:
+            mcts = mcts_red if game.red_to_move else mcts_black
+            actions, probs = mcts.get_action_probs(game, temperature=0.0, add_noise=False)
+            if not actions:
+                break
+
+            chosen_action = actions[int(np.argmax(probs))]
+            actual_action = chosen_action if game.red_to_move else flip_move(chosen_action)
+            game.step(actual_action)
+            mcts.update_with_move(chosen_action)
+            move_count += 1
+
+        winner = game.winner
+        if winner == 'draw' or winner is None:
+            draws += 1
+        elif (winner == 'red' and a_is_red) or (winner == 'black' and not a_is_red):
+            wins_a += 1
+        else:
+            wins_b += 1
+
+    total = wins_a + wins_b + draws
+    winrate_a = wins_a / total if total > 0 else 0.0
+    return winrate_a, wins_a, wins_b, draws
 
 
 def self_play_game(model, num_simulations=100, max_moves=200, temperature_threshold=30):
@@ -197,7 +259,8 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
                  buffer_size=10000, model_path=None, save_interval=10,
-                 use_grpo=False, grpo_group_size=8, use_fp16=False):
+                 use_grpo=False, grpo_group_size=8, use_fp16=False,
+                 gating_interval=20, gating_games=20, gating_winrate=0.55):
     """
     运行完整的训练流程
 
@@ -214,6 +277,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         use_grpo: 是否使用GRPO训练
         grpo_group_size: GRPO组采样大小
         use_fp16: 是否使用FP16混合精度训练
+        gating_interval: 每隔多少局进行一次 gating 评测（0 表示禁用）
+        gating_games: gating 评测对局数
+        gating_winrate: gating 接受阈值（新模型胜率需超过此值）
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
@@ -226,6 +292,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     else:
         print("创建新模型")
         model.build()
+
+    # 记录基准模型权重（用于 gating 回滚）
+    best_model_state = copy.deepcopy(model.model.state_dict())
 
     # GRPO 训练器
     grpo_trainer = None
@@ -250,6 +319,8 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     print(f"MCTS模拟次数: {num_simulations}")
     if use_grpo:
         print(f"GRPO组大小: {grpo_group_size}")
+    if gating_interval > 0:
+        print(f"Gating: 每 {gating_interval} 局评测 {gating_games} 局, 阈值 {gating_winrate:.0%}")
     print(f"模型保存路径: {model_path}")
     print(f"{'='*60}\n")
 
@@ -300,10 +371,38 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 )
                 print(f"  训练完成，平均损失: {avg_loss:.4f}")
 
-        # 定期保存模型
+        # 定期保存模型 & gating 评测
         if game_idx % save_interval == 0:
             model.save(model_path)
             print(f"  模型已保存到: {model_path}")
+
+        # Gating：定期评测新模型 vs 基准模型
+        if gating_interval > 0 and game_idx % gating_interval == 0:
+            print(f"  [Gating] 开始评测 (第 {game_idx} 局后)...")
+            ref_model = ChessModel(
+                num_channels=model.num_channels,
+                num_res_blocks=model.num_res_blocks
+            )
+            ref_model.build()
+            ref_model.model.load_state_dict(copy.deepcopy(best_model_state))
+            ref_model.model.eval()
+
+            winrate, wins, losses, draws_g = evaluate_models(
+                model, ref_model,
+                n_games=gating_games,
+                num_simulations=max(num_simulations // 2, 20),
+                max_moves=max_moves
+            )
+            print(f"  [Gating] 新模型胜率: {winrate:.2%} "
+                  f"(胜 {wins} / 负 {losses} / 和 {draws_g}), "
+                  f"阈值: {gating_winrate:.0%}")
+            if winrate > gating_winrate:
+                print(f"  [Gating] ✓ 新模型被接受，更新基准模型")
+                best_model_state = copy.deepcopy(model.model.state_dict())
+            else:
+                print(f"  [Gating] ✗ 新模型被拒绝，回滚至基准模型")
+                model.model.load_state_dict(copy.deepcopy(best_model_state))
+                model.model.eval()
 
     # 最终保存
     model.save(model_path)
@@ -342,6 +441,12 @@ def main():
                         help='GRPO组采样大小 (默认: 8)')
     parser.add_argument('--use_fp16', action='store_true',
                         help='使用FP16混合精度训练')
+    parser.add_argument('--gating_interval', type=int, default=20,
+                        help='每隔多少局进行 gating 评测，0 表示禁用 (默认: 20)')
+    parser.add_argument('--gating_games', type=int, default=20,
+                        help='gating 评测对局数 (默认: 20)')
+    parser.add_argument('--gating_winrate', type=float, default=0.55,
+                        help='gating 接受阈值，新模型胜率需超过此值 (默认: 0.55)')
 
     args = parser.parse_args()
     run_training(**vars(args))
