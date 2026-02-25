@@ -11,6 +11,9 @@ GRPO (Group Relative Policy Optimization) 训练器
     loss = trainer.train_step(states, legal_actions_list)
 """
 
+# GRPO主路径：train_step_from_trajectory使用对局回报z作为核心奖励信号
+# （胜=+1/负=-1/和=0），不使用value+log_prob伪奖励。
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -116,35 +119,19 @@ class GRPOTrainer:
 
     def evaluate_actions(self, model, states, actions):
         """
-        评估采样动作的价值
-
-        使用策略价值网络的价值头来估算每个动作的预期收益，
-        而非使用单独的 Critic 网络。
+        评估采样动作的价值（返回价值估计，不使用value+log_prob）
 
         Args:
-            model: ChessModel 实例
+            model: ChessModel实例
             states: (batch, 14, 10, 9) 棋盘特征
             actions: (batch, group_size) 动作索引
 
         Returns:
-            rewards: (batch, group_size) 估算的收益
+            rewards: (batch, group_size) 价值估计
         """
-        batch_size, group_size = actions.shape
-        device = states.device
-
-        # 获取当前策略和价值估计
         policy_logits, value = model.model(states)
-
-        # 用策略概率作为动作质量的代理指标；用 log_softmax 数值更稳定
-        log_policy = F.log_softmax(policy_logits, dim=-1)
-
-        rewards = torch.zeros(batch_size, group_size, device=device)
-        for g in range(group_size):
-            action_indices = actions[:, g]
-            # 组合价值估计和策略概率
-            action_log_probs = log_policy.gather(1, action_indices.unsqueeze(1)).squeeze(1)
-            rewards[:, g] = value.squeeze(-1) + action_log_probs
-
+        batch_size, group_size = actions.shape
+        rewards = value.squeeze(-1).unsqueeze(-1).expand(-1, group_size)
         return rewards
 
     def train_step(self, states, legal_masks, old_log_probs=None):
@@ -222,6 +209,95 @@ class GRPOTrainer:
         return {
             'loss': total_loss.item(),
             'policy_loss': policy_loss.item(),
+            'kl_loss': kl_div.item(),
+        }
+
+    def train_step_from_trajectory(self, states, legal_masks, actions, pi_mcts, z_values,
+                                    ref_log_probs=None):
+        """
+        从自对弈轨迹数据训练（GRPO主路径）。
+
+        Args:
+            states: (batch, 14, 10, 9) 棋盘特征
+            legal_masks: (batch, NUM_ACTIONS) 合法走法掩码
+            actions: (batch,) 自对弈中实际采取的动作索引
+            pi_mcts: (batch, NUM_ACTIONS) MCTS访问计数分布（教师分布）
+            z_values: (batch,) 对局回报（当前玩家视角：胜+1/负-1/和0）
+            ref_log_probs: 可选 (batch,) 参考策略的log概率，用于KL约束
+
+        Returns:
+            dict: 包含loss指标的字典
+        """
+        self.model.model.train()
+
+        if isinstance(states, np.ndarray):
+            states = torch.FloatTensor(states).to(self.model.device)
+        if isinstance(legal_masks, np.ndarray):
+            legal_masks = torch.FloatTensor(legal_masks).to(self.model.device)
+        if isinstance(actions, np.ndarray):
+            actions = torch.LongTensor(actions).to(self.model.device)
+        if isinstance(pi_mcts, np.ndarray):
+            pi_mcts = torch.FloatTensor(pi_mcts).to(self.model.device)
+        if isinstance(z_values, np.ndarray):
+            z_values = torch.FloatTensor(z_values).to(self.model.device)
+
+        amp_enabled = self.use_fp16 and states.device.type == 'cuda'
+
+        with torch.amp.autocast('cuda', enabled=amp_enabled):
+            policy_logits, value = self.model.model(states)
+
+            # 掩码非法走法
+            masked_logits = policy_logits.clone()
+            masked_logits[legal_masks == 0] = -1e9
+            log_probs = F.log_softmax(masked_logits, dim=-1)
+
+            # 价值损失：z_values为真实回报
+            value_loss = torch.mean((z_values - value.squeeze(-1)) ** 2)
+
+            # 策略损失：用z作为优势信号
+            baseline = value.squeeze(-1).detach()
+            advantage = z_values - baseline
+
+            # 当前动作的log概率
+            action_log_probs = log_probs.gather(1, actions.unsqueeze(1)).squeeze(1)
+            policy_loss = -(advantage.detach() * action_log_probs).mean()
+
+            # MCTS策略蒸馏损失
+            pi_loss = -torch.mean(
+                torch.sum(pi_mcts * log_probs, dim=1)
+            )
+
+            # KL正则化
+            if ref_log_probs is not None:
+                if isinstance(ref_log_probs, np.ndarray):
+                    ref_log_probs = torch.FloatTensor(ref_log_probs).to(self.model.device)
+                kl_div = F.kl_div(
+                    log_probs,
+                    F.softmax(ref_log_probs, dim=-1),
+                    reduction='batchmean'
+                )
+            else:
+                entropy = -(log_probs.exp() * log_probs).sum(dim=-1).mean()
+                kl_div = -0.01 * entropy
+
+            total_loss = policy_loss + pi_loss + value_loss + self.kl_coeff * kl_div
+
+        self.optimizer.zero_grad()
+        if self.scaler is not None:
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            total_loss.backward()
+            self.optimizer.step()
+
+        self.model.model.eval()
+
+        return {
+            'loss': total_loss.item(),
+            'policy_loss': policy_loss.item(),
+            'pi_loss': pi_loss.item(),
+            'value_loss': value_loss.item(),
             'kl_loss': kl_div.item(),
         }
 

@@ -19,6 +19,7 @@
 
 import numpy as np
 import copy
+import random
 
 # 棋子类型索引映射（用于神经网络输入平面）
 PIECE_TO_INDEX = {
@@ -90,6 +91,16 @@ ACTION_LABELS = create_action_labels()
 LABEL_TO_INDEX = {label: i for i, label in enumerate(ACTION_LABELS)}
 NUM_ACTIONS = len(ACTION_LABELS)
 
+_rng = random.Random(42)
+# 14 piece types × 90 squares Zobrist table
+_ZOBRIST_PIECES = [[_rng.getrandbits(64) for _ in range(90)] for _ in range(14)]
+_ZOBRIST_SIDE = _rng.getrandbits(64)  # side to move
+
+PIECE_TO_ZOBRIST_IDX = {
+    'P': 0, 'C': 1, 'R': 2, 'N': 3, 'B': 4, 'A': 5, 'K': 6,
+    'p': 7, 'c': 8, 'r': 9, 'n': 10, 'b': 11, 'a': 12, 'k': 13,
+}
+
 
 def flip_move(move):
     """翻转走法（用于黑方视角）"""
@@ -119,6 +130,11 @@ class ChessGame:
         self.red_to_move = True
         self.winner = None  # 'red', 'black', 'draw', or None
         self.num_moves = 0
+        self.pos_hash = 0
+        self.pos_history = []
+        self.move_history = []
+        self.check_history = []
+        self.terminate_reason = None
 
     def reset(self, fen=None):
         """重置棋盘到初始状态或指定FEN"""
@@ -129,6 +145,7 @@ class ChessGame:
         self.red_to_move = True
         self.winner = None
         self.num_moves = 0
+        self._init_hash()
         return self
 
     def _load_fen(self, fen):
@@ -218,8 +235,23 @@ class ChessGame:
         """深拷贝当前游戏状态"""
         return copy.deepcopy(self)
 
-    def get_legal_moves(self):
-        """获取当前方所有合法走法（已过滤走后己方被将军的走法）"""
+    def get_legal_moves(self, side=None):
+        """
+        获取合法走法列表。
+
+        Args:
+            side: 'red'|'black'|None。None表示当前走子方。
+        """
+        if side is not None:
+            old_red = self.red_to_move
+            self.red_to_move = (side == 'red')
+            moves = self._get_all_legal_moves()
+            self.red_to_move = old_red
+            return moves
+        return self._get_all_legal_moves()
+
+    def _get_all_legal_moves(self):
+        """获取当前方所有合法走法（内部方法）"""
         moves = []
         for y in range(BOARD_HEIGHT):
             for x in range(BOARD_WIDTH):
@@ -230,6 +262,124 @@ class ChessGame:
                         if not self._move_leaves_king_in_check(move):
                             moves.append(move)
         return moves
+
+    def _init_hash(self):
+        """初始化Zobrist哈希和历史"""
+        self.pos_hash = self._compute_hash()
+        self.pos_history = [self.pos_hash]
+        self.move_history = []
+        self.check_history = []
+        self.terminate_reason = None
+
+    def reset_history(self):
+        """重置历史（手动设置棋盘后调用）"""
+        self._init_hash()
+
+    def _compute_hash(self):
+        """从当前棋盘状态计算完整的Zobrist哈希"""
+        h = 0
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                piece = self.board[y][x]
+                if piece is not None and piece in PIECE_TO_ZOBRIST_IDX:
+                    sq = y * BOARD_WIDTH + x
+                    pidx = PIECE_TO_ZOBRIST_IDX[piece]
+                    h ^= _ZOBRIST_PIECES[pidx][sq]
+        if not self.red_to_move:
+            h ^= _ZOBRIST_SIDE
+        return h
+
+    def _zobrist_piece(self, piece, x, y):
+        """计算一个棋子对哈希的贡献"""
+        if piece is None or piece not in PIECE_TO_ZOBRIST_IDX:
+            return 0
+        sq = y * BOARD_WIDTH + x
+        return _ZOBRIST_PIECES[PIECE_TO_ZOBRIST_IDX[piece]][sq]
+
+    def is_in_check(self, for_red=None):
+        """
+        检查指定方是否处于被将状态。
+
+        Args:
+            for_red: True=检查红方, False=检查黑方, None=检查当前走子方
+
+        Returns:
+            bool
+        """
+        if for_red is None:
+            for_red = self.red_to_move
+        return self._is_in_check(for_red)
+
+    def _detect_perpetual_chase(self, cycle_moves):
+        """
+        长捉判负规则（待完善）。
+
+        注：长捉（perpetual chase）规则暂未实现，当前版本仅实现长将判负。
+        长捉判负规则待完善，当前版本仅实现长将判负。
+
+        Returns:
+            None
+        """
+        return None
+
+    def _detect_perpetual_check(self):
+        """
+        检测长将。
+
+        规则说明（简化版）：
+        采用规则：重复三次局面，若一方连续将军维持循环则判该方负；
+        双方均将或无法判定则和。简化：连续将军指循环内该方每次行棋后对方均处于被将状态。
+
+        Returns:
+            'red_loses' | 'black_loses' | 'draw' | None
+        """
+        current_hash = self.pos_hash
+        history = self.pos_history
+        if len(history) < 2:
+            return None
+
+        # 找最近一次出现相同局面的位置
+        cycle_start = None
+        for i in range(len(history) - 1, -1, -1):
+            if history[i] == current_hash:
+                cycle_start = i
+                break
+
+        if cycle_start is None:
+            return None
+
+        # 获取循环内的将军记录
+        cycle_checks = self.check_history[cycle_start:]
+        if not cycle_checks:
+            return None
+
+        # 确定循环起始时谁在走棋
+        # 游戏从红方开始，偶数步（0,2,4...）红方走
+        cycle_start_ply = cycle_start
+        red_to_move_at_cycle_start = (cycle_start_ply % 2 == 0)
+
+        # 按走棋方分类将军记录
+        red_checks = []
+        black_checks = []
+        for i, check in enumerate(cycle_checks):
+            mover_is_red = (i % 2 == 0) == red_to_move_at_cycle_start
+            if mover_is_red:
+                red_checks.append(check)
+            else:
+                black_checks.append(check)
+
+        if not red_checks or not black_checks:
+            return None
+
+        red_perpetual = all(red_checks)
+        black_perpetual = all(black_checks)
+
+        if red_perpetual and not black_perpetual:
+            return 'red_loses'
+        elif black_perpetual and not red_perpetual:
+            return 'black_loses'
+        else:
+            return 'draw'
 
     def _find_king(self, for_red):
         """查找将/帅的位置，返回 (x, y) 或 None"""
@@ -543,33 +693,99 @@ class ChessGame:
             action: 走法字符串 "x0y0x1y1"
 
         Returns:
-            bool: 走法是否成功
+            tuple: (obs, reward, done, info)
+            - obs: 当前玩家视角的观察
+            - reward: 走子方的即时奖励 (+1/-1/0)
+            - done: 游戏是否结束
+            - info: {'reason': terminate_reason, 'winner': winner}
         """
         x0, y0 = int(action[0]), int(action[1])
         x1, y1 = int(action[2]), int(action[3])
 
+        # 增量更新哈希：移除起始位置棋子
+        piece_moving = self.board[y0][x0]
         captured = self.board[y1][x1]
-        self.board[y1][x1] = self.board[y0][x0]
+
+        if piece_moving is not None:
+            self.pos_hash ^= self._zobrist_piece(piece_moving, x0, y0)
+        if captured is not None:
+            self.pos_hash ^= self._zobrist_piece(captured, x1, y1)
+
+        # 执行走法
+        self.board[y1][x1] = piece_moving
         self.board[y0][x0] = None
         self.num_moves += 1
+
+        # 增量更新哈希：添加目标位置棋子
+        if piece_moving is not None:
+            self.pos_hash ^= self._zobrist_piece(piece_moving, x1, y1)
+
+        # 记录是否将军（走棋后对方是否被将）
+        gave_check = self._is_in_check(not self.red_to_move)
+        self.check_history.append(gave_check)
+        self.move_history.append(action)
 
         # 检查是否吃掉了对方的将/帅
         if captured is not None and captured.upper() == 'K':
             self.winner = 'red' if self.red_to_move else 'black'
+            self.terminate_reason = 'king_captured'
 
         # 检查将帅是否面对面
         if self.winner is None:
             self._check_king_face()
 
+        # 切换走子方（更新哈希中的走子方标志）
+        self.pos_hash ^= _ZOBRIST_SIDE
         self.red_to_move = not self.red_to_move
 
-        # 检查对方是否无子可走
+        # 检测重复局面
+        if self.winner is None:
+            count = self.pos_history.count(self.pos_hash)
+            if count >= 2:  # 将成为第3次出现
+                perp_result = self._detect_perpetual_check()
+                if perp_result == 'red_loses':
+                    self.winner = 'black'
+                    self.terminate_reason = 'perpetual_check'
+                elif perp_result == 'black_loses':
+                    self.winner = 'red'
+                    self.terminate_reason = 'perpetual_check'
+                else:
+                    self.winner = 'draw'
+                    self.terminate_reason = 'repetition'
+
+        self.pos_history.append(self.pos_hash)
+
+        # 检查对方是否无子可走（将死或困毙）
         if self.winner is None:
             legal = self.get_legal_moves()
             if len(legal) == 0:
-                self.winner = 'black' if self.red_to_move else 'red'
+                if self._is_in_check(self.red_to_move):
+                    # 被将死
+                    self.winner = 'black' if self.red_to_move else 'red'
+                    self.terminate_reason = 'checkmate'
+                else:
+                    # 困毙（无子可走但未被将）
+                    self.winner = 'black' if self.red_to_move else 'red'
+                    self.terminate_reason = 'stalemate'
 
-        return True
+        # 计算奖励（从走子方视角）
+        if self.done:
+            if self.winner == 'draw':
+                reward = 0.0
+            else:
+                # red_to_move已切换，刚走棋的是 not self.red_to_move
+                just_moved_red = not self.red_to_move
+                if (self.winner == 'red' and just_moved_red) or \
+                   (self.winner == 'black' and not just_moved_red):
+                    reward = 1.0
+                else:
+                    reward = -1.0
+        else:
+            reward = 0.0
+
+        obs = self.get_observation()
+        info = {'reason': self.terminate_reason, 'winner': self.winner}
+        return obs, reward, self.done, info
 
     def _check_king_face(self):
         """检查将帅是否面对面（飞将）"""

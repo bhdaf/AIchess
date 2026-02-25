@@ -369,7 +369,7 @@ class GNNPolicyValueNet(nn.Module):
         p = F.relu(self.policy_bn(self.policy_conv(cnn_feat)))
         p = p.view(p.size(0), -1)
         p = torch.cat([p, gnn_feat], dim=-1)
-        p = F.softmax(self.policy_fc(p), dim=1)
+        p = self.policy_fc(p)  # return logits, no softmax
 
         # 价值头
         v = F.relu(self.value_bn(self.value_conv(cnn_feat)))

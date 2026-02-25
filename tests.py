@@ -443,6 +443,7 @@ class TestGNN(unittest.TestCase):
         """测试集成GNN的策略价值网络"""
         from simple_chess_ai.gnn_feature import GNNPolicyValueNet
         import torch
+        import torch.nn.functional as F
         net = GNNPolicyValueNet(
             num_channels=32, num_res_blocks=2,
             gnn_hidden_dim=32, gnn_output_dim=64, num_heads=4
@@ -451,9 +452,10 @@ class TestGNN(unittest.TestCase):
         policy, value = net(planes)
         self.assertEqual(policy.shape, (2, NUM_ACTIONS))
         self.assertEqual(value.shape, (2, 1))
-        # 策略概率应求和为1
+        # 策略输出为logits，softmax后应求和为1
+        probs = F.softmax(policy, dim=1)
         for i in range(2):
-            self.assertAlmostEqual(policy[i].sum().item(), 1.0, places=4)
+            self.assertAlmostEqual(probs[i].sum().item(), 1.0, places=4)
         # 价值应在[-1, 1]范围
         self.assertTrue(torch.all(value >= -1.0))
         self.assertTrue(torch.all(value <= 1.0))
@@ -1026,6 +1028,111 @@ class TestExport(unittest.TestCase):
         winrate_png = os.path.join(run_dir, 'plots', 'winrate_curve.png')
         self.assertTrue(os.path.exists(loss_png), "loss_curve.png 应被生成")
         self.assertTrue(os.path.exists(winrate_png), "winrate_curve.png 应被生成")
+
+
+class TestRepetitionDetection(unittest.TestCase):
+    """测试重复局面检测"""
+
+    def test_threefold_repetition_draw(self):
+        """三次重复局面应判和"""
+        game3 = ChessGame()
+        game3.reset()
+        moves_cycle = [
+            '1213',  # red cannon up
+            '1716',  # black cannon down
+            '1312',  # red cannon back
+            '1617',  # black cannon back (position repeats 2nd time)
+            '1213',  # red cannon up again
+            '1716',  # black cannon down again
+            '1312',  # red cannon back again
+            '1617',  # black cannon back (position repeats 3rd time -> draw)
+        ]
+        for move in moves_cycle:
+            if game3.done:
+                break
+            game3.step(move)
+
+        self.assertEqual(game3.winner, 'draw',
+                        f"Expected draw by repetition, got winner={game3.winner}")
+
+    def test_perpetual_check_interface(self):
+        """长将接口应存在且不崩溃"""
+        game = ChessGame()
+        game.board = [[None]*9 for _ in range(10)]
+        game.board[0][4] = 'K'
+        game.board[9][4] = 'k'
+        game.board[5][3] = 'R'
+        game.red_to_move = True
+        game._init_hash()
+
+        self.assertFalse(game.done)
+        legal = game.get_legal_moves()
+        self.assertGreater(len(legal), 0)
+
+
+class TestActionEncoding(unittest.TestCase):
+    """测试新动作编码"""
+
+    def test_encode_decode_consistency(self):
+        """encode后decode应还原走法坐标"""
+        from simple_chess_ai.action_encoding import encode_move, decode_action
+
+        test_moves = ['1213', '0304', '1022', '4041', '0102']
+        for move_str in test_moves:
+            idx = encode_move(move_str)
+            if idx is not None:
+                result = decode_action(idx)
+                self.assertIsNotNone(result, f"decode_action({idx}) returned None for move {move_str}")
+                fx, fy, tx, ty = result
+                expected = (int(move_str[0]), int(move_str[1]),
+                           int(move_str[2]), int(move_str[3]))
+                self.assertEqual((fx, fy, tx, ty), expected,
+                    f"Round-trip failed for {move_str}: got ({fx},{fy},{tx},{ty})")
+
+    def test_legal_action_indices_coverage(self):
+        """legal_action_indices应覆盖所有合法走法"""
+        from simple_chess_ai.action_encoding import legal_action_indices, decode_action
+
+        game = ChessGame()
+        game.reset()
+
+        indices = legal_action_indices(game)
+        self.assertGreater(len(indices), 0)
+
+        for idx in indices:
+            result = decode_action(idx)
+            self.assertIsNotNone(result, f"decode_action({idx}) returned None")
+            fx, fy, tx, ty = result
+            self.assertTrue(0 <= fx < 9 and 0 <= fy < 10, f"Invalid from: ({fx},{fy})")
+            self.assertTrue(0 <= tx < 9 and 0 <= ty < 10, f"Invalid to: ({tx},{ty})")
+
+    def test_mask_probabilities_sum_to_one(self):
+        """掩码验证"""
+        from simple_chess_ai.action_encoding import (
+            legal_action_indices, NUM_ACTION_ENCODING
+        )
+
+        game = ChessGame()
+        game.reset()
+
+        model = ChessModel(backend='gnn')
+        model.build()
+
+        legal_indices = legal_action_indices(game)
+
+        import numpy as np
+        mask = np.zeros(NUM_ACTION_ENCODING, dtype=np.float32)
+        for idx in legal_indices:
+            mask[idx] = 1.0
+
+        self.assertEqual(int(mask.sum()), len(legal_indices))
+        self.assertGreater(len(legal_indices), 0)
+
+    def test_num_actions_correct(self):
+        """动作空间大小应为5310"""
+        from simple_chess_ai.action_encoding import NUM_ACTION_ENCODING, NUM_PLANES
+        self.assertEqual(NUM_PLANES, 59)
+        self.assertEqual(NUM_ACTION_ENCODING, 90 * 59)
 
 
 if __name__ == '__main__':

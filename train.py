@@ -255,6 +255,7 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
                 scaler.update()
             else:
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
                 optimizer.step()
 
             total_loss += loss.item()
@@ -281,7 +282,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  buffer_size=10000, model_path=None, save_interval=10,
                  use_grpo=False, grpo_group_size=8, use_fp16=False,
                  gating_interval=20, gating_games=20, gating_winrate=0.55,
-                 seed=None, deterministic=False, runs_dir=None):
+                 seed=None, deterministic=False, runs_dir=None, quick=False):
     """
     运行完整的训练流程
 
@@ -308,6 +309,15 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
 
+    # 快速模式：减少训练量以快速验证流程
+    if quick:
+        num_games = 1
+        num_simulations = 10
+        num_epochs = 1
+        batch_size = 16
+        gating_interval = 0
+        max_moves = 50
+
     # best 模型路径 = model_path；周期性保存使用同目录下的 last.pth
     model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
     last_model_path = os.path.join(model_dir, 'last.pth')
@@ -326,7 +336,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
             torch.backends.cudnn.benchmark = False
 
     # 初始化模型
-    model = ChessModel(num_channels=128, num_res_blocks=4)
+    model = ChessModel(num_channels=128, num_res_blocks=4, backend='gnn')
     if os.path.exists(model_path):
         print(f"加载已有模型: {model_path}")
         model.load(model_path)
@@ -425,17 +435,27 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         avg_loss = 0.0
         if len(data_buffer) >= batch_size:
             if use_grpo and grpo_trainer is not None:
-                # GRPO 训练模式
-                from simple_chess_ai.grpo import generate_grpo_training_data
-                grpo_game = ChessGame()
-                grpo_game.reset()
-                grpo_states, grpo_masks = generate_grpo_training_data(
-                    model, grpo_game
-                )
-                grpo_metrics = grpo_trainer.train_step(grpo_states, grpo_masks)
-                avg_loss = grpo_metrics.get('loss', 0.0)
-                print(f"  GRPO训练完成，损失: {grpo_metrics['loss']:.4f}, "
-                      f"策略损失: {grpo_metrics['policy_loss']:.4f}")
+                # GRPO 训练模式：使用轨迹数据和真实回报z
+                if len(data_buffer) >= batch_size:
+                    import random as _random
+                    batch_data = _random.sample(list(data_buffer), min(batch_size, len(data_buffer)))
+                    b_states = np.array([d[0] for d in batch_data])
+                    b_policies = np.array([d[1] for d in batch_data])
+                    b_values = np.array([d[2] for d in batch_data], dtype=np.float32)
+
+                    # 构建合法走法掩码（用策略分布的非零项作为代理）
+                    b_masks = (b_policies > 0).astype(np.float32)
+                    # 取策略分布中概率最大的动作
+                    b_actions = np.argmax(b_policies, axis=1)
+
+                    grpo_metrics = grpo_trainer.train_step_from_trajectory(
+                        b_states, b_masks, b_actions, b_policies, b_values
+                    )
+                    avg_loss = grpo_metrics.get('loss', 0.0)
+                    print(f"  GRPO训练完成，损失: {grpo_metrics['loss']:.4f}, "
+                          f"策略损失: {grpo_metrics['policy_loss']:.4f}")
+                else:
+                    avg_loss = 0.0
             else:
                 # 标准训练模式
                 train_data = list(data_buffer)
@@ -557,6 +577,8 @@ def main():
                         help='开启 cuDNN 确定性模式（配合 --seed 使用，可能降低训练速度）')
     parser.add_argument('--runs_dir', type=str, default=None,
                         help=f'数据与日志导出根目录 (默认: simple_chess_ai/runs/)')
+    parser.add_argument('--quick', action='store_true',
+                        help='快速模式：1局自对弈+1次参数更新，用于验证流程')
 
     args = parser.parse_args()
     run_training(**vars(args))
