@@ -216,7 +216,9 @@ def plot_curves(run_dir):
                 reader = csv.DictReader(f)
                 for row in reader:
                     game_indices.append(int(row['game_idx']))
-                    winrates.append(float(row['winrate']))
+                    # 支持新字段 score（draw=0.5 计分）及旧字段 winrate
+                    score_val = row.get('score') or row.get('winrate', '0')
+                    winrates.append(float(score_val))
                     accepted_flags.append(row.get('accepted', '').lower() == 'true')
 
             if game_indices:

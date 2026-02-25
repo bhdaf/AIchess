@@ -51,10 +51,11 @@ DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), 'train_data')
 
 def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=200):
     """
-    通过对局评测两个模型，返回 model_a 的胜率。
+    通过对局评测两个模型，返回 model_a 的 score（draw=0.5 计分）。
 
     对弈时禁用 Dirichlet 噪声，使用温度=0 的确定性走法，
     并交替红黑方以减少先手优势偏差。
+    score = (wins_a + 0.5 * draws) / total
 
     Args:
         model_a: 候选新模型
@@ -64,7 +65,8 @@ def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=
         max_moves: 每局最大步数
 
     Returns:
-        (winrate_a, wins_a, wins_b, draws)
+        (score, wins_a, wins_b, draws)
+        其中 score = (wins_a + 0.5 * draws) / total，draw 计 0.5 分
     """
     wins_a = 0
     wins_b = 0
@@ -106,8 +108,8 @@ def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=
             wins_b += 1
 
     total = wins_a + wins_b + draws
-    winrate_a = wins_a / total if total > 0 else 0.0
-    return winrate_a, wins_a, wins_b, draws
+    score = (wins_a + 0.5 * draws) / total if total > 0 else 0.0
+    return score, wins_a, wins_b, draws
 
 
 def self_play_game(model, num_simulations=100, max_moves=200, temperature_threshold=30):
@@ -306,6 +308,10 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
 
+    # best 模型路径 = model_path；周期性保存使用同目录下的 last.pth
+    model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
+    last_model_path = os.path.join(model_dir, 'last.pth')
+
     # ── 可复现性：设置随机种子 ──────────────────────────────────────────────
     if seed is not None:
         import random
@@ -327,6 +333,10 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     else:
         print("创建新模型")
         model.build()
+        # best 模型文件不存在时，用随机初始化的模型作为初始 best 并保存
+        os.makedirs(model_dir, exist_ok=True)
+        model.save(model_path)
+        print(f"初始化 best 模型已保存到: {model_path}")
 
     # 保存本次训练的配置（供复现/追溯）
     training_config = dict(
@@ -345,7 +355,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     run_dir = init_run_dir(runs_dir=runs_dir, config=training_config)
     print(f"数据导出目录: {run_dir}")
 
-    # 记录基准模型权重（用于 gating 回滚）
+    # 记录 best 模型权重（仅用于 gating 对比，不回滚训练）
     best_model_state = copy.deepcopy(model.model.state_dict())
 
     # GRPO 训练器
@@ -445,10 +455,10 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 'elapsed_s': round(elapsed, 2),
             })
 
-        # 定期保存模型 & gating 评测
+        # 定期保存模型（候选模型保存为 last.pth，不覆盖 best）
         if game_idx % save_interval == 0:
-            model.save(model_path)
-            print(f"  模型已保存到: {model_path}")
+            model.save(last_model_path)
+            print(f"  候选模型已保存到: {last_model_path}")
 
         # Gating：定期评测新模型 vs 基准模型
         if gating_interval > 0 and game_idx % gating_interval == 0:
@@ -461,44 +471,45 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
             ref_model.model.load_state_dict(copy.deepcopy(best_model_state))
             ref_model.model.eval()
 
-            winrate, wins, losses, draws_g = evaluate_models(
+            score, wins, losses, draws_g = evaluate_models(
                 model, ref_model,
                 n_games=gating_games,
                 num_simulations=max(num_simulations // 2, 20),
                 max_moves=max_moves
             )
-            print(f"  [Gating] 新模型胜率: {winrate:.2%} "
-                  f"(胜 {wins} / 负 {losses} / 和 {draws_g}), "
-                  f"阈值: {gating_winrate:.0%}")
-            if winrate > gating_winrate:
-                print(f"  [Gating] ✓ 新模型被接受，更新基准模型")
+            print(f"  [Gating] 胜 {wins} / 负 {losses} / 和 {draws_g}, "
+                  f"score: {score:.0%}, 阈值: {gating_winrate:.0%}")
+            if score > gating_winrate:
+                print(f"  [Gating] ✓ 新模型被接受，更新 best 模型")
                 best_model_state = copy.deepcopy(model.model.state_dict())
+                model.save(model_path)
+                print(f"  [Gating] best 模型已保存到: {model_path}")
                 gating_accepted = True
             else:
-                print(f"  [Gating] ✗ 新模型被拒绝，回滚至基准模型")
-                model.model.load_state_dict(copy.deepcopy(best_model_state))
-                model.model.eval()
+                print(f"  [Gating] ✗ 新模型未超过阈值，best 模型不变，训练继续")
                 gating_accepted = False
 
             # ── Gating 评测结果落盘（CSV）────────────────────────────────────
             append_gating_csv(run_dir, {
                 'game_idx': game_idx,
                 'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
-                'winrate': round(winrate, 4),
-                'wins': wins,
-                'losses': losses,
+                'wins_a': wins,
+                'wins_b': losses,
                 'draws': draws_g,
+                'score': round(score, 4),
+                'gating_winrate': gating_winrate,
                 'accepted': gating_accepted,
             })
 
-    # 最终保存
-    model.save(model_path)
+    # 最终保存候选模型（best 已在 gating 通过时实时更新到 model_path）
+    model.save(last_model_path)
     print(f"\n{'='*60}")
     print(f"训练完成！")
     print(f"红方胜: {stats['red_wins']}, "
           f"黑方胜: {stats['black_wins']}, "
           f"和棋: {stats['draws']}")
-    print(f"模型已保存到: {model_path}")
+    print(f"最终候选模型已保存到: {last_model_path}")
+    print(f"best 模型路径: {model_path}")
     print(f"数据导出目录: {run_dir}")
 
     # ── 自动生成图表 ─────────────────────────────────────────────────────────

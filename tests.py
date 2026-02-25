@@ -691,21 +691,22 @@ class TestEvaluateModels(unittest.TestCase):
     """测试模型评测函数"""
 
     def test_evaluate_returns_valid_stats(self):
-        """evaluate_models 返回合法的胜率和统计"""
+        """evaluate_models 返回合法的 score（draw=0.5）和统计"""
         from simple_chess_ai.train import evaluate_models
         model_a = ChessModel(num_channels=32, num_res_blocks=2)
         model_a.build()
         model_b = ChessModel(num_channels=32, num_res_blocks=2)
         model_b.build()
-        winrate, wins, losses, draws = evaluate_models(
+        score, wins, losses, draws = evaluate_models(
             model_a, model_b, n_games=4, num_simulations=5, max_moves=50
         )
         total = wins + losses + draws
         self.assertEqual(total, 4)
-        self.assertGreaterEqual(winrate, 0.0)
-        self.assertLessEqual(winrate, 1.0)
+        self.assertGreaterEqual(score, 0.0)
+        self.assertLessEqual(score, 1.0)
         if total > 0:
-            self.assertAlmostEqual(winrate, wins / total, places=5)
+            expected_score = (wins + 0.5 * draws) / total
+            self.assertAlmostEqual(score, expected_score, places=5)
 
 
 class TestMCTSRootReset(unittest.TestCase):
@@ -981,8 +982,8 @@ class TestExport(unittest.TestCase):
         """append_gating_csv 应正确记录 gating 结果"""
         import csv
         run_dir = self.init_run_dir(runs_dir=self.tmpdir)
-        row = {'game_idx': 20, 'winrate': 0.6, 'wins': 12,
-               'losses': 8, 'draws': 0, 'accepted': True}
+        row = {'game_idx': 20, 'wins_a': 12, 'wins_b': 8,
+               'draws': 0, 'score': 0.6, 'gating_winrate': 0.55, 'accepted': True}
         self.append_gating_csv(run_dir, row)
         path = os.path.join(run_dir, 'gating_metrics.csv')
         self.assertTrue(os.path.exists(path))
@@ -990,7 +991,7 @@ class TestExport(unittest.TestCase):
             reader = csv.DictReader(f)
             rows = list(reader)
         self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(float(rows[0]['winrate']), 0.6)
+        self.assertAlmostEqual(float(rows[0]['score']), 0.6)
 
     def test_plot_curves_no_matplotlib(self):
         """即使没有 matplotlib，plot_curves 也不应抛出异常"""
@@ -1017,9 +1018,9 @@ class TestExport(unittest.TestCase):
         for i in range(1, 6):
             self.append_training_csv(run_dir, {'game_idx': i, 'loss': 1.0 / i,
                                                'buffer_size': i * 100, 'elapsed_s': 5.0})
-            self.append_gating_csv(run_dir, {'game_idx': i * 10, 'winrate': 0.5 + i * 0.02,
-                                              'wins': i, 'losses': 5 - i,
-                                              'draws': 0, 'accepted': i > 2})
+            self.append_gating_csv(run_dir, {'game_idx': i * 10, 'wins_a': i, 'wins_b': 5 - i,
+                                              'draws': 0, 'score': 0.5 + i * 0.02,
+                                              'gating_winrate': 0.55, 'accepted': i > 2})
         self.plot_curves(run_dir)
         loss_png = os.path.join(run_dir, 'plots', 'loss_curve.png')
         winrate_png = os.path.join(run_dir, 'plots', 'winrate_curve.png')
