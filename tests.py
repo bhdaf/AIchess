@@ -1069,6 +1069,105 @@ class TestRepetitionDetection(unittest.TestCase):
         legal = game.get_legal_moves()
         self.assertGreater(len(legal), 0)
 
+    def test_perpetual_chase_red_loses(self):
+        """红方长捉判负：红车反复追捉黑马，黑方无捉回"""
+        # 棋盘：
+        #   红帅(4,0)  红仕(4,1)[阻止飞将]  黑将(4,9)
+        #   红车(0,5)  黑马(3,5)  黑车(8,5)
+        # 循环：红车在(0,5)和(2,5)间往返，始终攻击黑马(3,5)
+        #        黑车在(8,5)和(7,5)间往返，不攻击任何红方非将棋子
+        game = ChessGame()
+        game.board = [[None]*9 for _ in range(10)]
+        game.board[0][4] = 'K'   # 红帅(4,0)
+        game.board[9][4] = 'k'   # 黑将(4,9)
+        game.board[1][4] = 'A'   # 红仕(4,1) 阻止将帅飞将
+        game.board[5][0] = 'R'   # 红车(0,5)
+        game.board[5][3] = 'n'   # 黑马(3,5)
+        game.board[5][8] = 'r'   # 黑车(8,5)
+        game.red_to_move = True
+        game._init_hash()
+
+        # 红车(0,5)->(2,5)攻击黑马(3,5)，黑车往返不攻击红方非将棋子，循环三次
+        moves_cycle = [
+            '0525',  # 红车(0,5)->(2,5)，攻击黑马(3,5)
+            '8575',  # 黑车(8,5)->(7,5)，不捉任何红方非将棋子
+            '2505',  # 红车(2,5)->(0,5)，仍攻击黑马(3,5)
+            '7585',  # 黑车(7,5)->(8,5)，不捉任何红方非将棋子
+            '0525',  # 重复第1步
+            '8575',
+            '2505',
+            '7585',  # 第3次重复 -> 长捉触发
+        ]
+        for move in moves_cycle:
+            if game.done:
+                break
+            game.step(move)
+
+        self.assertTrue(game.done, "长捉循环应触发终局")
+        self.assertEqual(game.winner, 'black',
+                         f"红方长捉应判红方负（黑方胜），实际: "
+                         f"winner={game.winner}, reason={game.terminate_reason}")
+        self.assertEqual(game.terminate_reason, 'perpetual_chase')
+
+    def test_perpetual_chase_draw_both_chase(self):
+        """双方均长捉时判和（终局原因为 repetition，非 perpetual_chase）"""
+        # 棋盘：红车追黑马，黑车追红马，双方均长捉
+        game = ChessGame()
+        game.board = [[None]*9 for _ in range(10)]
+        game.board[0][4] = 'K'   # 红帅(4,0)
+        game.board[9][4] = 'k'   # 黑将(4,9)
+        game.board[1][4] = 'A'   # 红仕(4,1) 阻止飞将
+        game.board[8][4] = 'a'   # 黑仕(4,8) 阻止飞将
+        game.board[5][0] = 'R'   # 红车(0,5)
+        game.board[5][3] = 'n'   # 黑马(3,5)
+        game.board[4][8] = 'r'   # 黑车(8,4)
+        game.board[4][5] = 'N'   # 红马(5,4)
+        game.red_to_move = True
+        game._init_hash()
+
+        # 红车攻击黑马，黑车攻击红马，双方均长捉，循环三次
+        moves_cycle = [
+            '0525',  # 红车(0,5)->(2,5)攻击黑马(3,5)
+            '8464',  # 黑车(8,4)->(6,4)攻击红马(5,4)
+            '2505',  # 红车回原位，仍攻击黑马
+            '6484',  # 黑车回原位，仍攻击红马
+            '0525',  # 重复
+            '8464',
+            '2505',
+            '6484',  # 第3次重复
+        ]
+        for move in moves_cycle:
+            if game.done:
+                break
+            game.step(move)
+
+        self.assertTrue(game.done, "长捉循环应触发终局")
+        # 双方均长捉时不应判为 perpetual_chase
+        self.assertNotEqual(game.terminate_reason, 'perpetual_chase',
+                            "双方均长捉时不应判单方负")
+
+    def test_get_chased_pieces(self):
+        """_get_chased_pieces 应正确识别被攻击的非将棋子"""
+        game = ChessGame()
+        game.board = [[None]*9 for _ in range(10)]
+        game.board[0][4] = 'K'   # 红帅(4,0)
+        game.board[9][4] = 'k'   # 黑将(4,9)
+        game.board[5][0] = 'R'   # 红车(0,5)
+        game.board[5][3] = 'n'   # 黑马(3,5)
+        game.board[5][8] = 'r'   # 黑车(8,5)
+        game.red_to_move = True
+        game._init_hash()
+
+        # 将红车移到(2,5)，此时红车攻击黑马(3,5)
+        game.board[5][2] = 'R'
+        game.board[5][0] = None
+
+        chased = game._get_chased_pieces(True)  # 红方捉子
+        self.assertIn((3, 5), chased,
+                      "红车在(2,5)应攻击黑马(3,5)")
+        self.assertNotIn((4, 9), chased,
+                         "将/帅不参与捉子计算")
+
 
 class TestActionEncoding(unittest.TestCase):
     """测试新动作编码"""

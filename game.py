@@ -134,6 +134,7 @@ class ChessGame:
         self.pos_history = []
         self.move_history = []
         self.check_history = []
+        self.chase_history = []
         self.terminate_reason = None
 
     def reset(self, fen=None):
@@ -269,6 +270,7 @@ class ChessGame:
         self.pos_history = [self.pos_hash]
         self.move_history = []
         self.check_history = []
+        self.chase_history = []
         self.terminate_reason = None
 
     def reset_history(self):
@@ -310,17 +312,103 @@ class ChessGame:
             for_red = self.red_to_move
         return self._is_in_check(for_red)
 
-    def _detect_perpetual_chase(self, cycle_moves):
+    def _detect_perpetual_chase(self):
         """
-        长捉判负规则（待完善）。
+        长捉判负规则。
 
-        注：长捉（perpetual chase）规则暂未实现，当前版本仅实现长将判负。
-        长捉判负规则待完善，当前版本仅实现长将判负。
+        在三次重复局面的循环内，若一方始终在捉对方的某一个（或多个）固定棋子，
+        而另一方未始终如此，则捉子方判负。
+
+        "捉"的定义（简化）：走棋后己方棋子直接攻击对方非将棋子。
 
         Returns:
-            None
+            'red_loses' | 'black_loses' | None
         """
-        return None
+        current_hash = self.pos_hash
+        history = self.pos_history
+
+        # 找循环起始位置（与 _detect_perpetual_check 相同逻辑）
+        cycle_start = None
+        for i in range(len(history) - 1, -1, -1):
+            if history[i] == current_hash:
+                cycle_start = i
+                break
+
+        if cycle_start is None or not self.chase_history:
+            return None
+
+        cycle_chases = self.chase_history[cycle_start:]
+        if not cycle_chases:
+            return None
+
+        # 确定循环起始时谁在走棋
+        cycle_start_ply = cycle_start
+        red_to_move_at_cycle_start = (cycle_start_ply % 2 == 0)
+
+        # 按走棋方分类捉子集合
+        red_chases = []
+        black_chases = []
+        for i, chased in enumerate(cycle_chases):
+            mover_is_red = (i % 2 == 0) == red_to_move_at_cycle_start
+            if mover_is_red:
+                red_chases.append(chased)
+            else:
+                black_chases.append(chased)
+
+        if not red_chases or not black_chases:
+            return None
+
+        # 红方是否始终在捉某个固定棋子（循环内所有红方走棋后均攻击同一棋子）
+        red_common = red_chases[0]
+        for c in red_chases[1:]:
+            red_common = red_common & c
+        red_perpetual = len(red_common) > 0
+
+        # 黑方是否始终在捉某个固定棋子
+        black_common = black_chases[0]
+        for c in black_chases[1:]:
+            black_common = black_common & c
+        black_perpetual = len(black_common) > 0
+
+        if red_perpetual and not black_perpetual:
+            return 'red_loses'
+        elif black_perpetual and not red_perpetual:
+            return 'black_loses'
+        else:
+            return None
+
+    def _get_chased_pieces(self, attacker_is_red):
+        """
+        返回被 attacker_is_red 方"捉"的对方非将棋子的坐标集合。
+
+        "捉"的定义（简化）：攻击方可通过下一步直接吃掉对方非将棋子。
+        通过枚举攻击方各棋子的伪合法走法来判断，避免误用飞将规则。
+
+        Args:
+            attacker_is_red: True 表示检查红方捉黑方棋子；False 反之。
+
+        Returns:
+            frozenset of (x, y) tuples
+        """
+        chased = set()
+        # 临时切换走子方，以便正确生成攻击方棋子的走法
+        old_red = self.red_to_move
+        self.red_to_move = attacker_is_red
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                piece = self.board[y][x]
+                if piece is None:
+                    continue
+                if piece.isupper() != attacker_is_red:
+                    continue  # 非攻击方棋子
+                for move in self._get_piece_moves(x, y, piece):
+                    tx, ty = int(move[2]), int(move[3])
+                    target = self.board[ty][tx]
+                    # 吃子走法且目标不是将/帅
+                    if target is not None and target.upper() != 'K':
+                        chased.add((tx, ty))
+        self.red_to_move = old_red
+        return frozenset(chased)
 
     def _detect_perpetual_check(self):
         """
@@ -723,6 +811,9 @@ class ChessGame:
         # 记录是否将军（走棋后对方是否被将）
         gave_check = self._is_in_check(not self.red_to_move)
         self.check_history.append(gave_check)
+        # 记录是否捉子（走棋后己方直接攻击对方非将棋子）
+        gave_chase = self._get_chased_pieces(self.red_to_move)
+        self.chase_history.append(gave_chase)
         self.move_history.append(action)
 
         # 检查是否吃掉了对方的将/帅
@@ -750,8 +841,16 @@ class ChessGame:
                     self.winner = 'red'
                     self.terminate_reason = 'perpetual_check'
                 else:
-                    self.winner = 'draw'
-                    self.terminate_reason = 'repetition'
+                    chase_result = self._detect_perpetual_chase()
+                    if chase_result == 'red_loses':
+                        self.winner = 'black'
+                        self.terminate_reason = 'perpetual_chase'
+                    elif chase_result == 'black_loses':
+                        self.winner = 'red'
+                        self.terminate_reason = 'perpetual_chase'
+                    else:
+                        self.winner = 'draw'
+                        self.terminate_reason = 'repetition'
 
         self.pos_history.append(self.pos_hash)
 
