@@ -25,6 +25,7 @@ simple_chess_ai/
 ├── model.py           # 策略价值网络（PyTorch）
 ├── mcts.py            # 蒙特卡洛树搜索
 ├── train.py           # 训练管线（自对弈+训练，支持GRPO和FP16）
+├── export.py          # 数据与图片导出管线（JSONL/CSV/PNG）
 ├── grpo.py            # GRPO训练器（Group Relative Policy Optimization）
 ├── gnn_feature.py     # GNN特征提取（图卷积/图注意力网络）
 ├── reasoning.py       # 推理增强模块（Chain-of-Thought）
@@ -32,6 +33,15 @@ simple_chess_ai/
 ├── gui.py             # Pygame图形界面
 ├── cli.py             # 命令行界面
 ├── tests.py           # 单元测试
+├── runs/              # 训练日志与数据导出（自动创建）
+│   └── run_<timestamp>/
+│       ├── config.json          训练配置与元信息
+│       ├── self_play.jsonl      自对弈记录（每行一局）
+│       ├── training_metrics.csv 训练指标（loss、buffer_size 等）
+│       ├── gating_metrics.csv   gating 评测结果（胜率、是否接受等）
+│       └── plots/
+│           ├── loss_curve.png   训练损失曲线
+│           └── winrate_curve.png gating 胜率曲线
 └── README.md          # 说明文档
 ```
 
@@ -41,10 +51,13 @@ simple_chess_ai/
 - PyTorch >= 1.9.0
 - NumPy
 - Pygame（图形界面需要）
+- matplotlib（可选，用于自动生成训练曲线图）
 
 安装依赖：
 ```bash
 pip install torch numpy pygame
+# 可选：自动生成训练曲线图（PNG）
+pip install matplotlib
 ```
 
 ## 使用方法
@@ -111,6 +124,20 @@ python -m simple_chess_ai train --model_path my_model.pth
 | `--gating_winrate` | 0.55 | gating 接受阈值（新模型胜率需超过此值） |
 | `--seed` | None | 随机种子（设置后可复现数据生成序列） |
 | `--deterministic` | False | 开启 cuDNN 确定性模式（配合 `--seed` 使用，**注意可能降低训练速度**） |
+| `--runs_dir` | 自动 | 数据与日志导出根目录（默认 `simple_chess_ai/runs/`） |
+
+训练结束后，输出目录示例：
+
+```
+simple_chess_ai/runs/run_20240101_120000/
+    config.json              训练超参数与元信息
+    self_play.jsonl          每局自对弈记录（每行一个 JSON 对象）
+    training_metrics.csv     训练指标（game_idx、loss、buffer_size 等）
+    gating_metrics.csv       gating 评测结果（winrate、是否接受等）
+    plots/
+        loss_curve.png       训练损失曲线图
+        winrate_curve.png    gating 胜率曲线图
+```
 
 ### 推荐训练参数
 
@@ -133,12 +160,16 @@ python -m simple_chess_ai play \
     --model_path my_model.pth \
     --num_simulations 400 \
     --human_color red
+
+# 指定截图保存目录
+python -m simple_chess_ai play --screenshot_dir my_screenshots/
 ```
 
 操作说明：
 - **点击棋子**选择要走的棋子（绿色高亮显示合法目标）
 - **点击目标位置**完成走子
 - **按R键**或**点击重新开始按钮**重新开始
+- **按S键**保存当前棋盘截图为 PNG（默认保存到 `simple_chess_ai/runs/screenshots/`）
 - 红方在下方，黑方在上方
 
 ### 3. 命令行对弈
@@ -160,6 +191,15 @@ python -m simple_chess_ai reason
 推理模式会在每次AI走子前输出思维链分析，展示AI的推理过程。
 
 ## 技术架构
+
+### 数据与图片导出管线（export.py）
+- 训练时自动创建带时间戳的运行目录（`runs/run_<timestamp>/`）
+- **自对弈数据落盘**：每局结果写入 `self_play.jsonl`（每行一个 JSON 对象，包含局数、胜方、步数、耗时等）
+- **训练指标落盘**：每局训练后将 loss、buffer_size 等写入 `training_metrics.csv`
+- **gating 评测落盘**：每次评测结果（胜率、胜/负/和、是否接受）写入 `gating_metrics.csv`
+- **自动生成 PNG 曲线图**：训练结束后调用 `plot_curves()` 生成 loss 曲线和 gating 胜率曲线（需安装 matplotlib）
+- **GUI 截图**：在图形界面中按 `S` 键保存当前棋盘为 PNG（`save_board_screenshot()`）
+- 所有函数带有异常处理，不影响训练主流程
 
 ### 神经网络
 - **输入**: 14×10×9 特征平面（7种棋子×2方）

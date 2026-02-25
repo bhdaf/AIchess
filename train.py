@@ -22,6 +22,7 @@ import json
 import time
 import copy
 import argparse
+import datetime
 import numpy as np
 from collections import deque
 
@@ -36,6 +37,11 @@ from simple_chess_ai.game import (
 )
 from simple_chess_ai.model import ChessModel
 from simple_chess_ai.mcts import MCTS
+from simple_chess_ai.export import (
+    init_run_dir, append_self_play_jsonl,
+    append_training_csv, append_gating_csv, plot_curves,
+    DEFAULT_RUNS_DIR,
+)
 
 # 默认模型保存路径
 DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(__file__), 'saved_model')
@@ -273,7 +279,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  buffer_size=10000, model_path=None, save_interval=10,
                  use_grpo=False, grpo_group_size=8, use_fp16=False,
                  gating_interval=20, gating_games=20, gating_winrate=0.55,
-                 seed=None, deterministic=False):
+                 seed=None, deterministic=False, runs_dir=None):
     """
     运行完整的训练流程
 
@@ -295,6 +301,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         gating_winrate: gating 接受阈值（新模型胜率需超过此值）
         seed: 随机种子（None 表示不固定）
         deterministic: 是否启用 cuDNN 确定性模式（可能降低训练速度）
+        runs_dir: 日志与数据导出根目录（默认 simple_chess_ai/runs/，None 表示使用默认）
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
@@ -322,7 +329,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         model.build()
 
     # 保存本次训练的配置（供复现/追溯）
-    _save_training_config(model_path, dict(
+    training_config = dict(
         num_games=num_games, num_simulations=num_simulations,
         num_epochs=num_epochs, batch_size=batch_size, lr=lr,
         max_moves=max_moves, buffer_size=buffer_size,
@@ -331,7 +338,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         gating_interval=gating_interval, gating_games=gating_games,
         gating_winrate=gating_winrate, seed=seed,
         deterministic=deterministic,
-    ))
+    )
+    _save_training_config(model_path, training_config)
+
+    # ── 初始化数据导出目录 ────────────────────────────────────────────────────
+    run_dir = init_run_dir(runs_dir=runs_dir, config=training_config)
+    print(f"数据导出目录: {run_dir}")
 
     # 记录基准模型权重（用于 gating 回滚）
     best_model_state = copy.deepcopy(model.model.state_dict())
@@ -389,7 +401,18 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
               f"缓冲区: {len(data_buffer)}, "
               f"耗时: {elapsed:.1f}s")
 
+        # ── 自对弈记录落盘（JSONL）──────────────────────────────────────────
+        append_self_play_jsonl(run_dir, {
+            'game_idx': game_idx,
+            'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+            'winner': winner or 'draw',
+            'num_moves': moves,
+            'num_samples': len(data),
+            'elapsed_s': round(elapsed, 2),
+        })
+
         # 训练（每局都训练，但数据足够时才有效）
+        avg_loss = 0.0
         if len(data_buffer) >= batch_size:
             if use_grpo and grpo_trainer is not None:
                 # GRPO 训练模式
@@ -400,6 +423,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                     model, grpo_game
                 )
                 grpo_metrics = grpo_trainer.train_step(grpo_states, grpo_masks)
+                avg_loss = grpo_metrics.get('loss', 0.0)
                 print(f"  GRPO训练完成，损失: {grpo_metrics['loss']:.4f}, "
                       f"策略损失: {grpo_metrics['policy_loss']:.4f}")
             else:
@@ -410,6 +434,16 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                     epochs=num_epochs, lr=lr, use_fp16=use_fp16
                 )
                 print(f"  训练完成，平均损失: {avg_loss:.4f}")
+
+        # ── 训练指标落盘（CSV）──────────────────────────────────────────────
+        if len(data_buffer) >= batch_size:
+            append_training_csv(run_dir, {
+                'game_idx': game_idx,
+                'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+                'loss': round(avg_loss, 6),
+                'buffer_size': len(data_buffer),
+                'elapsed_s': round(elapsed, 2),
+            })
 
         # 定期保存模型 & gating 评测
         if game_idx % save_interval == 0:
@@ -439,10 +473,23 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
             if winrate > gating_winrate:
                 print(f"  [Gating] ✓ 新模型被接受，更新基准模型")
                 best_model_state = copy.deepcopy(model.model.state_dict())
+                gating_accepted = True
             else:
                 print(f"  [Gating] ✗ 新模型被拒绝，回滚至基准模型")
                 model.model.load_state_dict(copy.deepcopy(best_model_state))
                 model.model.eval()
+                gating_accepted = False
+
+            # ── Gating 评测结果落盘（CSV）────────────────────────────────────
+            append_gating_csv(run_dir, {
+                'game_idx': game_idx,
+                'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+                'winrate': round(winrate, 4),
+                'wins': wins,
+                'losses': losses,
+                'draws': draws_g,
+                'accepted': gating_accepted,
+            })
 
     # 最终保存
     model.save(model_path)
@@ -452,6 +499,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
           f"黑方胜: {stats['black_wins']}, "
           f"和棋: {stats['draws']}")
     print(f"模型已保存到: {model_path}")
+    print(f"数据导出目录: {run_dir}")
+
+    # ── 自动生成图表 ─────────────────────────────────────────────────────────
+    print("正在生成训练曲线图...")
+    plot_curves(run_dir)
+
     print(f"{'='*60}")
 
 
@@ -491,6 +544,8 @@ def main():
                         help='随机种子，设置后可复现数据生成序列 (默认: None)')
     parser.add_argument('--deterministic', action='store_true',
                         help='开启 cuDNN 确定性模式（配合 --seed 使用，可能降低训练速度）')
+    parser.add_argument('--runs_dir', type=str, default=None,
+                        help=f'数据与日志导出根目录 (默认: simple_chess_ai/runs/)')
 
     args = parser.parse_args()
     run_training(**vars(args))

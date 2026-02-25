@@ -5,6 +5,7 @@
 """
 
 import unittest
+import os
 import numpy as np
 
 from simple_chess_ai.game import (
@@ -883,6 +884,147 @@ class TestMCTSCache(unittest.TestCase):
         actions_cache, _ = mcts_cache.get_action_probs(game, temperature=1.0)
         # 两者返回的走法集合应相同（都是合法走法）
         self.assertEqual(sorted(actions_no_cache), sorted(actions_cache))
+
+
+class TestExport(unittest.TestCase):
+    """测试数据与图片导出管线 (export.py)"""
+
+    def setUp(self):
+        import tempfile
+        from simple_chess_ai.export import (
+            init_run_dir, append_self_play_jsonl,
+            append_training_csv, append_gating_csv, plot_curves,
+        )
+        self.tmpdir = tempfile.mkdtemp()
+        self.init_run_dir = init_run_dir
+        self.append_self_play_jsonl = append_self_play_jsonl
+        self.append_training_csv = append_training_csv
+        self.append_gating_csv = append_gating_csv
+        self.plot_curves = plot_curves
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_init_run_dir_creates_directories(self):
+        """init_run_dir 应创建带时间戳的运行目录及 plots/ 子目录"""
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        self.assertTrue(os.path.isdir(run_dir))
+        self.assertTrue(os.path.isdir(os.path.join(run_dir, 'plots')))
+
+    def test_init_run_dir_saves_config(self):
+        """init_run_dir 传入 config 时应生成 config.json"""
+        import json
+        config = {'num_games': 10, 'lr': 0.001}
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir, config=config)
+        config_path = os.path.join(run_dir, 'config.json')
+        self.assertTrue(os.path.exists(config_path))
+        with open(config_path, encoding='utf-8') as f:
+            saved = json.load(f)
+        self.assertEqual(saved['num_games'], 10)
+        self.assertIn('_run_dir', saved)
+        self.assertIn('_start_time', saved)
+
+    def test_append_self_play_jsonl(self):
+        """append_self_play_jsonl 应正确写入 JSONL 文件"""
+        import json
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        record = {'game_idx': 1, 'winner': 'red', 'num_moves': 80,
+                  'num_samples': 80, 'elapsed_s': 5.2}
+        self.append_self_play_jsonl(run_dir, record)
+        path = os.path.join(run_dir, 'self_play.jsonl')
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding='utf-8') as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 1)
+        loaded = json.loads(lines[0])
+        self.assertEqual(loaded['winner'], 'red')
+        self.assertEqual(loaded['game_idx'], 1)
+
+    def test_append_self_play_jsonl_multiple(self):
+        """多次追加应生成多行 JSONL"""
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        for i in range(1, 4):
+            self.append_self_play_jsonl(run_dir, {'game_idx': i, 'winner': 'draw'})
+        path = os.path.join(run_dir, 'self_play.jsonl')
+        with open(path, encoding='utf-8') as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 3)
+
+    def test_append_training_csv(self):
+        """append_training_csv 应写入表头和数据行"""
+        import csv
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        row = {'game_idx': 1, 'loss': 2.34, 'buffer_size': 256, 'elapsed_s': 5.0}
+        self.append_training_csv(run_dir, row)
+        path = os.path.join(run_dir, 'training_metrics.csv')
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(float(rows[0]['loss']), 2.34)
+
+    def test_append_training_csv_no_duplicate_header(self):
+        """多次追加时表头不应重复"""
+        import csv
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        for i in range(3):
+            self.append_training_csv(run_dir, {'game_idx': i, 'loss': float(i)})
+        path = os.path.join(run_dir, 'training_metrics.csv')
+        with open(path, encoding='utf-8') as f:
+            lines = f.readlines()
+        # 1 header + 3 data = 4 lines
+        self.assertEqual(len(lines), 4)
+
+    def test_append_gating_csv(self):
+        """append_gating_csv 应正确记录 gating 结果"""
+        import csv
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        row = {'game_idx': 20, 'winrate': 0.6, 'wins': 12,
+               'losses': 8, 'draws': 0, 'accepted': True}
+        self.append_gating_csv(run_dir, row)
+        path = os.path.join(run_dir, 'gating_metrics.csv')
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(float(rows[0]['winrate']), 0.6)
+
+    def test_plot_curves_no_matplotlib(self):
+        """即使没有 matplotlib，plot_curves 也不应抛出异常"""
+        import sys
+        import unittest.mock as mock
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        # 写入一些 CSV 数据
+        self.append_training_csv(run_dir, {'game_idx': 1, 'loss': 1.0})
+        # 模拟 matplotlib 不存在
+        with mock.patch.dict(sys.modules, {'matplotlib': None}):
+            try:
+                self.plot_curves(run_dir)  # 不应抛出
+            except Exception as e:
+                self.fail(f"plot_curves raised exception without matplotlib: {e}")
+
+    def test_plot_curves_with_data(self):
+        """有数据时 plot_curves 应生成 PNG 文件（如果 matplotlib 可用）"""
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib 未安装，跳过图表生成测试")
+
+        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
+        for i in range(1, 6):
+            self.append_training_csv(run_dir, {'game_idx': i, 'loss': 1.0 / i,
+                                               'buffer_size': i * 100, 'elapsed_s': 5.0})
+            self.append_gating_csv(run_dir, {'game_idx': i * 10, 'winrate': 0.5 + i * 0.02,
+                                              'wins': i, 'losses': 5 - i,
+                                              'draws': 0, 'accepted': i > 2})
+        self.plot_curves(run_dir)
+        loss_png = os.path.join(run_dir, 'plots', 'loss_curve.png')
+        winrate_png = os.path.join(run_dir, 'plots', 'winrate_curve.png')
+        self.assertTrue(os.path.exists(loss_png), "loss_curve.png 应被生成")
+        self.assertTrue(os.path.exists(winrate_png), "winrate_curve.png 应被生成")
 
 
 if __name__ == '__main__':
