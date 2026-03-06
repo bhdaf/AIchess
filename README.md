@@ -1,6 +1,6 @@
-# 简化中国象棋AI (Simple Chinese Chess AI)
+# 中国象棋AI (Simple Chinese Chess AI)
 
-基于 [ChineseChess-AlphaZero](https://github.com/bhdaf/ChineseChess-AlphaZero) 项目简化而来的中国象棋智能体。
+基于深度强化学习的中国象棋智能体。
 
 ## 特点
 
