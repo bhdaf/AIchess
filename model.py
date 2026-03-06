@@ -144,7 +144,14 @@ class ChessModel:
         if self.model is None:
             self.build()
         state_dict = torch.load(path, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(state_dict)
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"模型权重加载失败（{e}）。\n"
+                "提示：若使用的是旧版 GNN 模型文件，请删除后重新训练：\n"
+                "  python -m simple_chess_ai train"
+            ) from e
         self.model.eval()
         return True
 
