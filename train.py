@@ -30,6 +30,7 @@ from simple_chess_ai.model import ChessModel
 from simple_chess_ai.mcts import MCTS
 from simple_chess_ai.export import (
     init_run_dir, append_self_play_jsonl, append_training_csv,
+    append_evaluation_csv, load_evaluation_state, save_evaluation_state,
 )
 
 # 默认模型保存路径
@@ -219,10 +220,37 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
     return total_loss / max(num_batches, 1)
 
 
+def compute_elo_update(r_current, r_opponent, score, k=32):
+    """
+    计算 ELO 评分更新。
+
+    使用 Logistic 期望值公式：
+
+    .. code-block:: text
+
+        expected = 1 / (1 + 10 ** ((R_opp - R_cur) / 400))
+        R_cur_new = R_cur + K * (S - expected)
+
+    Args:
+        r_current (float): 当前模型的 ELO 评分。
+        r_opponent (float): 对手模型的 ELO 评分。
+        score (float): 本次对局的观测得分（win=1.0, draw=0.5, loss=0.0）。
+        k (float): K 因子，控制评分变化幅度（默认 32）。
+
+    Returns:
+        tuple[float, float]: ``(new_rating, delta)`` 更新后的评分和变化量。
+    """
+    expected = 1.0 / (1.0 + 10.0 ** ((r_opponent - r_current) / 400.0))
+    delta = k * (score - expected)
+    return r_current + delta, delta
+
+
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
                  buffer_size=10000, model_path=None, save_interval=10,
-                 quick=False):
+                 quick=False,
+                 eval_interval=0, eval_games=40, eval_simulations=50,
+                 eval_opponent='previous', elo_k=32):
     """
     运行完整的训练流程
 
@@ -237,6 +265,11 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         model_path: 模型保存路径
         save_interval: 每隔多少局保存一次模型
         quick: 快速模式，用于验证流程
+        eval_interval: 每隔多少局进行一次评测（0 表示禁用）
+        eval_games: 评测对局数
+        eval_simulations: 评测每步MCTS模拟次数
+        eval_opponent: 评测对手类型（'previous' / 'self'）
+        elo_k: ELO K 因子
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
@@ -267,9 +300,20 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         num_games=num_games, num_simulations=num_simulations,
         num_epochs=num_epochs, batch_size=batch_size, lr=lr,
         max_moves=max_moves, buffer_size=buffer_size,
+        eval_interval=eval_interval, eval_games=eval_games,
+        eval_simulations=eval_simulations, eval_opponent=eval_opponent,
+        elo_k=elo_k,
     )
     run_dir = init_run_dir(config=training_config)
     print(f"日志目录: {run_dir}")
+
+    # 初始化评测状态（含 ELO）
+    eval_state = load_evaluation_state(run_dir)
+
+    # 设置基准模型路径（用于 eval_opponent='previous'）
+    baseline_path = os.path.join(run_dir, 'baseline.pth')
+    if eval_interval > 0 and eval_opponent == 'previous':
+        model.save(baseline_path)
 
     data_buffer = deque(maxlen=buffer_size)
     stats = {'red_wins': 0, 'black_wins': 0, 'draws': 0}
@@ -279,6 +323,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     print(f"自对弈局数: {num_games}")
     print(f"MCTS模拟次数: {num_simulations}")
     print(f"模型保存路径: {model_path}")
+    if eval_interval > 0:
+        print(f"评测间隔: 每 {eval_interval} 局, 对局数: {eval_games}, "
+              f"对手: {eval_opponent}")
     print(f"{'='*60}\n")
 
     for game_idx in range(1, num_games + 1):
@@ -333,6 +380,58 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
             model.save(model_path)
             print(f"  模型已保存到: {model_path}")
 
+        # 定期评测
+        if eval_interval > 0 and game_idx % eval_interval == 0:
+            print(f"  [评测] 第 {game_idx} 局，开始评测...")
+            if eval_opponent == 'self':
+                opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+                opponent_model.build()
+                opponent_label = 'self'
+            else:
+                # 'previous': 对战上一个基准模型
+                opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+                if os.path.exists(baseline_path):
+                    opponent_model.load(baseline_path)
+                else:
+                    opponent_model.build()
+                opponent_label = 'previous'
+
+            score, wins, losses, draws_eval = evaluate_models(
+                model, opponent_model,
+                n_games=eval_games,
+                num_simulations=eval_simulations,
+                max_moves=max_moves,
+            )
+
+            elo_cur = eval_state.get('elo_current', 1500.0)
+            elo_opp = eval_state.get('elo_opponent', 1500.0)
+            new_elo, elo_delta = compute_elo_update(elo_cur, elo_opp, score, k=elo_k)
+            eval_state['elo_current'] = new_elo
+            eval_state['last_game_idx'] = game_idx
+            eval_state['last_opponent'] = opponent_label
+            save_evaluation_state(run_dir, eval_state)
+
+            print(f"  [评测] 胜: {wins}, 负: {losses}, 和: {draws_eval}, "
+                  f"score: {score:.3f}, ELO: {new_elo:.1f} (Δ{elo_delta:+.1f})")
+
+            append_evaluation_csv(run_dir, {
+                'game_idx': game_idx,
+                'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+                'opponent': opponent_label,
+                'eval_games': eval_games,
+                'eval_sims': eval_simulations,
+                'wins': wins,
+                'losses': losses,
+                'draws': draws_eval,
+                'score': round(score, 6),
+                'elo': round(new_elo, 2),
+                'elo_delta': round(elo_delta, 2),
+            })
+
+            # 更新基准模型为当前检查点
+            if eval_opponent == 'previous':
+                model.save(baseline_path)
+
     model.save(model_path)
     print(f"\n{'='*60}")
     print(f"训练完成！")
@@ -362,6 +461,17 @@ def main():
                         help='模型保存路径')
     parser.add_argument('--quick', action='store_true',
                         help='快速模式：1局+1次训练，用于验证流程')
+    parser.add_argument('--eval_interval', type=int, default=0,
+                        help='每隔多少局进行一次评测（0 表示禁用，默认: 0）')
+    parser.add_argument('--eval_games', type=int, default=40,
+                        help='每次评测对局数 (默认: 40)')
+    parser.add_argument('--eval_simulations', type=int, default=50,
+                        help='评测每步MCTS模拟次数 (默认: 50)')
+    parser.add_argument('--eval_opponent', type=str, default='previous',
+                        choices=['previous', 'self'],
+                        help='评测对手类型：previous=上一基准模型, self=随机初始模型 (默认: previous)')
+    parser.add_argument('--elo_k', type=float, default=32,
+                        help='ELO K 因子，控制评分变化幅度 (默认: 32)')
 
     args = parser.parse_args()
     run_training(**vars(args))

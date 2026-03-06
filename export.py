@@ -10,6 +10,8 @@
         config.json              训练超参数及元信息
         self_play.jsonl          每局自对弈记录（每行一个 JSON 对象）
         training_metrics.csv     训练指标（game_idx、loss、buffer_size 等）
+        evaluation_metrics.csv   评测指标（game_idx、score、elo 等）
+        evaluation_state.json    ELO 状态（当前评分、基准模型信息等）
 """
 
 import os
@@ -90,5 +92,65 @@ def append_training_csv(run_dir, row):
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
+    except OSError:
+        traceback.print_exc()
+
+
+def append_evaluation_csv(run_dir, row):
+    """
+    将评测指标一行追加写入 ``evaluation_metrics.csv``。
+
+    Args:
+        run_dir (str): 运行目录路径。
+        row (dict): 指标字典，字段名作为 CSV 列名。
+            推荐字段：``game_idx``, ``timestamp``, ``opponent``,
+            ``eval_games``, ``eval_sims``, ``wins``, ``losses``,
+            ``draws``, ``score``, ``elo``, ``elo_delta``。
+    """
+    path = os.path.join(run_dir, 'evaluation_metrics.csv')
+    write_header = not os.path.exists(path)
+    try:
+        with open(path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except OSError:
+        traceback.print_exc()
+
+
+def load_evaluation_state(run_dir):
+    """
+    从 ``evaluation_state.json`` 加载 ELO 状态。
+
+    Args:
+        run_dir (str): 运行目录路径。
+
+    Returns:
+        dict: ELO 状态字典。若文件不存在则返回默认初始状态
+            ``{'elo_current': 1500.0, 'elo_opponent': 1500.0}``。
+    """
+    path = os.path.join(run_dir, 'evaluation_state.json')
+    if os.path.exists(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            traceback.print_exc()
+    return {'elo_current': 1500.0, 'elo_opponent': 1500.0}
+
+
+def save_evaluation_state(run_dir, state):
+    """
+    将 ELO 状态保存到 ``evaluation_state.json``。
+
+    Args:
+        run_dir (str): 运行目录路径。
+        state (dict): ELO 状态字典（包含 ``elo_current``、``elo_opponent`` 等键）。
+    """
+    path = os.path.join(run_dir, 'evaluation_state.json')
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
     except OSError:
         traceback.print_exc()
