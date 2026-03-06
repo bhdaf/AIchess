@@ -107,28 +107,15 @@ class ChessModel:
     处理模型的构建、保存、加载和预测。
     """
 
-    def __init__(self, num_channels=128, num_res_blocks=4, backend='gnn',
-                 gnn_hidden_dim=64, gnn_output_dim=128):
+    def __init__(self, num_channels=128, num_res_blocks=4):
         self.device = get_device()
         self.num_channels = num_channels
         self.num_res_blocks = num_res_blocks
-        self.backend = backend
-        self.gnn_hidden_dim = gnn_hidden_dim
-        self.gnn_output_dim = gnn_output_dim
         self.model = None
 
     def build(self):
         """构建网络"""
-        if self.backend == 'gnn':
-            from simple_chess_ai.gnn_feature import GNNPolicyValueNet
-            self.model = GNNPolicyValueNet(
-                num_channels=self.num_channels,
-                num_res_blocks=self.num_res_blocks,
-                gnn_hidden_dim=self.gnn_hidden_dim,
-                gnn_output_dim=self.gnn_output_dim,
-            )
-        else:
-            self.model = PolicyValueNet(self.num_channels, self.num_res_blocks)
+        self.model = PolicyValueNet(self.num_channels, self.num_res_blocks)
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -139,9 +126,6 @@ class ChessModel:
         config = {
             'num_channels': self.num_channels,
             'num_res_blocks': self.num_res_blocks,
-            'backend': self.backend,
-            'gnn_hidden_dim': self.gnn_hidden_dim,
-            'gnn_output_dim': self.gnn_output_dim,
         }
         with open(config_path, 'w') as f:
             json.dump(config, f)
@@ -157,13 +141,17 @@ class ChessModel:
                 config = json.load(f)
             self.num_channels = config.get('num_channels', 128)
             self.num_res_blocks = config.get('num_res_blocks', 4)
-            self.backend = config.get('backend', 'cnn')
-            self.gnn_hidden_dim = config.get('gnn_hidden_dim', 64)
-            self.gnn_output_dim = config.get('gnn_output_dim', 128)
         if self.model is None:
             self.build()
         state_dict = torch.load(path, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(state_dict)
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"模型权重加载失败（{e}）。\n"
+                "提示：若使用的是旧版 GNN 模型文件，请删除后重新训练：\n"
+                "  python -m simple_chess_ai train"
+            ) from e
         self.model.eval()
         return True
 

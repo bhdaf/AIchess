@@ -8,7 +8,7 @@
 - AI使用MCTS搜索走法
 
 用法:
-    python -m simple_chess_ai.gui [--model_path path/to/model.pth]
+    python -m simple_chess_ai play [--model_path path/to/model.pth]
 """
 
 import os
@@ -24,7 +24,6 @@ from simple_chess_ai.game import (
 )
 from simple_chess_ai.model import ChessModel
 from simple_chess_ai.mcts import MCTS
-from simple_chess_ai.export import save_board_screenshot
 
 # 默认模型路径
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'saved_model', 'model.pth')
@@ -113,12 +112,10 @@ class ChessGUI:
         human_color: 人类方颜色 ('red' 或 'black')
     """
 
-    def __init__(self, model_path=None, num_simulations=200, human_color='red',
-                 screenshot_dir=None):
+    def __init__(self, model_path=None, num_simulations=200, human_color='red'):
         self.model_path = model_path or DEFAULT_MODEL_PATH
         self.num_simulations = num_simulations
         self.human_color = human_color
-        self.screenshot_dir = screenshot_dir
 
         self.game = ChessGame()
         self.game.reset()
@@ -196,14 +193,6 @@ class ChessGUI:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_r:
                         self._reset_game()
-                    elif event.key == pygame.K_s:
-                        # 保存棋盘截图
-                        out = save_board_screenshot(screen, save_dir=self.screenshot_dir)
-                        if out:
-                            self.status_text = f"Screenshot saved: {os.path.basename(out)}"
-                            print(f"棋盘截图已保存: {out}")
-                        else:
-                            self.status_text = "Screenshot failed"
 
             self._draw(screen, pygame)
             pygame.display.flip()
@@ -541,12 +530,10 @@ class ChessGUI:
         if cn:
             hint_strs = ["\u64cd\u4f5c\u8bf4\u660e:", "\u70b9\u51fb\u9009\u62e9\u68cb\u5b50",
                          "\u70b9\u51fb\u76ee\u6807\u4f4d\u7f6e\u8d70\u68cb",
-                         "\u6309R\u952e\u91cd\u65b0\u5f00\u59cb",
-                         "\u6309S\u952e\u4fdd\u5b58\u622a\u56fe"]
+                         "\u6309R\u952e\u91cd\u65b0\u5f00\u59cb"]
         else:
             hint_strs = ["Instructions:", "Click to select piece",
-                         "Click target to move", "Press R to restart",
-                         "Press S to screenshot"]
+                         "Click target to move", "Press R to restart"]
         for s in hint_strs:
             screen.blit(self.small_font.render(s, True, COLOR_TEXT), (panel_x, y))
             y += 22
@@ -578,15 +565,12 @@ def main():
     parser.add_argument('--human_color', type=str, default='red',
                         choices=['red', 'black'],
                         help='人类执哪方 (默认: red)')
-    parser.add_argument('--screenshot_dir', type=str, default=None,
-                        help='截图保存目录（默认: simple_chess_ai/runs/screenshots/）')
 
     args = parser.parse_args()
     gui = ChessGUI(
         model_path=args.model_path,
         num_simulations=args.num_simulations,
         human_color=args.human_color,
-        screenshot_dir=args.screenshot_dir,
     )
     gui.run()
 

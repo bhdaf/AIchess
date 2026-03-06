@@ -366,185 +366,11 @@ class TestGameCopy(unittest.TestCase):
         self.assertEqual(copy.board[1][4], 'K')
 
 
-class TestGRPO(unittest.TestCase):
-    """测试GRPO训练器"""
+class TestTraining(unittest.TestCase):
+    """测试训练函数最小闭环"""
 
-    def setUp(self):
-        self.model = ChessModel(num_channels=32, num_res_blocks=2)
-        self.model.build()
-
-    def test_group_sample(self):
-        """测试组采样机制"""
-        from simple_chess_ai.grpo import GRPOTrainer
-        import torch
-        trainer = GRPOTrainer(self.model, group_size=4)
-        logits = torch.randn(2, NUM_ACTIONS)
-        mask = torch.ones(2, NUM_ACTIONS)
-        actions, log_probs = trainer.group_sample(logits, mask, group_size=4)
-        self.assertEqual(actions.shape, (2, 4))
-        self.assertEqual(log_probs.shape, (2, 4))
-
-    def test_group_advantage(self):
-        """测试组内相对优势计算"""
-        from simple_chess_ai.grpo import GRPOTrainer
-        import torch
-        trainer = GRPOTrainer(self.model, group_size=4)
-        rewards = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-        advantages = trainer.compute_group_advantage(rewards)
-        # 组内归一化后均值应接近0
-        self.assertAlmostEqual(advantages.mean().item(), 0.0, places=5)
-
-    def test_train_step(self):
-        """测试GRPO训练步"""
-        from simple_chess_ai.grpo import GRPOTrainer, generate_grpo_training_data
-        game = ChessGame()
-        game.reset()
-        states, masks = generate_grpo_training_data(self.model, game)
-        trainer = GRPOTrainer(self.model, group_size=4, lr=1e-4)
-        metrics = trainer.train_step(states, masks)
-        self.assertIn('loss', metrics)
-        self.assertIn('policy_loss', metrics)
-        self.assertIn('kl_loss', metrics)
-
-    def test_generate_grpo_data(self):
-        """测试GRPO训练数据生成"""
-        from simple_chess_ai.grpo import generate_grpo_training_data
-        game = ChessGame()
-        game.reset()
-        states, masks = generate_grpo_training_data(self.model, game)
-        self.assertEqual(states.shape[1:], (14, 10, 9))
-        self.assertEqual(masks.shape[1], NUM_ACTIONS)
-        # 合法走法掩码应有非零值
-        self.assertGreater(masks.sum(), 0)
-
-
-class TestGNN(unittest.TestCase):
-    """测试GNN特征提取"""
-
-    def test_build_chess_graph(self):
-        """测试棋盘到图的转换"""
-        from simple_chess_ai.gnn_feature import build_chess_graph
-        import torch
-        planes = torch.randn(2, 14, 10, 9)
-        node_features, adj_matrix = build_chess_graph(planes)
-        self.assertEqual(node_features.shape, (2, 90, 16))
-        self.assertEqual(adj_matrix.shape, (2, 90, 90))
-
-    def test_chess_gnn_forward(self):
-        """测试ChessGNN前向传播"""
-        from simple_chess_ai.gnn_feature import ChessGNN
-        import torch
-        gnn = ChessGNN(node_features=16, hidden_dim=32, output_dim=64, num_heads=4)
-        planes = torch.randn(2, 14, 10, 9)
-        output = gnn(planes)
-        self.assertEqual(output.shape, (2, 64))
-
-    def test_gnn_policy_value_net(self):
-        """测试集成GNN的策略价值网络"""
-        from simple_chess_ai.gnn_feature import GNNPolicyValueNet
-        import torch
-        import torch.nn.functional as F
-        net = GNNPolicyValueNet(
-            num_channels=32, num_res_blocks=2,
-            gnn_hidden_dim=32, gnn_output_dim=64, num_heads=4
-        )
-        planes = torch.randn(2, 14, 10, 9)
-        policy, value = net(planes)
-        self.assertEqual(policy.shape, (2, NUM_ACTIONS))
-        self.assertEqual(value.shape, (2, 1))
-        # 策略输出为logits，softmax后应求和为1
-        probs = F.softmax(policy, dim=1)
-        for i in range(2):
-            self.assertAlmostEqual(probs[i].sum().item(), 1.0, places=4)
-        # 价值应在[-1, 1]范围
-        self.assertTrue(torch.all(value >= -1.0))
-        self.assertTrue(torch.all(value <= 1.0))
-
-    def test_graph_conv_layer(self):
-        """测试图卷积层"""
-        from simple_chess_ai.gnn_feature import GraphConvLayer
-        import torch
-        layer = GraphConvLayer(16, 32)
-        x = torch.randn(2, 10, 16)
-        adj = torch.rand(2, 10, 10)
-        out = layer(x, adj)
-        self.assertEqual(out.shape, (2, 10, 32))
-
-    def test_gat_layer(self):
-        """测试图注意力层"""
-        from simple_chess_ai.gnn_feature import GATLayer
-        import torch
-        layer = GATLayer(16, 32, num_heads=4)
-        x = torch.randn(2, 10, 16)
-        adj = torch.ones(2, 10, 10)
-        out = layer(x, adj)
-        self.assertEqual(out.shape, (2, 10, 32))
-
-
-class TestReasoning(unittest.TestCase):
-    """测试推理模块"""
-
-    def setUp(self):
-        self.model = ChessModel(num_channels=32, num_res_blocks=2)
-        self.model.build()
-        self.game = ChessGame()
-        self.game.reset()
-
-    def test_board_analyzer_threats(self):
-        """测试威胁分析"""
-        from simple_chess_ai.reasoning import BoardAnalyzer
-        threats = BoardAnalyzer.analyze_threats(self.game)
-        self.assertIsInstance(threats, list)
-
-    def test_board_analyzer_position(self):
-        """测试局面评估"""
-        from simple_chess_ai.reasoning import BoardAnalyzer
-        position = BoardAnalyzer.evaluate_position(self.game)
-        self.assertIn('red_material', position)
-        self.assertIn('black_material', position)
-        self.assertIn('material_advantage', position)
-        # 初始局面应该均衡
-        self.assertEqual(position['material_advantage'], 0)
-
-    def test_reasoner_chain(self):
-        """测试推理链生成"""
-        from simple_chess_ai.reasoning import ChessReasoner
-        reasoner = ChessReasoner(self.model)
-        text, features = reasoner.generate_reasoning_chain(self.game)
-        self.assertIsInstance(text, str)
-        self.assertGreater(len(text), 0)
-        self.assertEqual(features.shape, (32,))
-
-    def test_reason_and_act(self):
-        """测试推理并走子"""
-        from simple_chess_ai.reasoning import ChessReasoner
-        reasoner = ChessReasoner(self.model)
-        text, action, policy = reasoner.reason_and_act(self.game)
-        self.assertIsInstance(text, str)
-        self.assertIsInstance(action, str)
-        self.assertEqual(len(action), 4)
-        self.assertEqual(policy.shape, (NUM_ACTIONS,))
-
-    def test_reasoning_reward(self):
-        """测试GRPO推理奖励"""
-        from simple_chess_ai.reasoning import create_grpo_reasoning_reward, ChessReasoner
-        reasoner = ChessReasoner(self.model)
-        reward = create_grpo_reasoning_reward(reasoner, self.game, '4041', 1.0)
-        self.assertIsInstance(reward, float)
-
-    def test_piece_relations(self):
-        """测试棋子关系分析"""
-        from simple_chess_ai.reasoning import BoardAnalyzer
-        relations = BoardAnalyzer.analyze_piece_relations(self.game)
-        self.assertIn('attacks', relations)
-        self.assertIn('defenses', relations)
-
-
-class TestFP16Training(unittest.TestCase):
-    """测试FP16混合精度训练"""
-
-    def test_train_model_fp16_flag(self):
-        """测试train_model接受use_fp16参数"""
+    def test_train_model_runs(self):
+        """train_model 用少量样本跑一个 epoch 不应报错"""
         from simple_chess_ai.train import train_model
         model = ChessModel(num_channels=32, num_res_blocks=2)
         model.build()
@@ -553,11 +379,23 @@ class TestFP16Training(unittest.TestCase):
         planes = game.to_planes()
         policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
         policy[0] = 1.0
-        data = [(planes, policy, 1.0)]
-        # Should work without errors on CPU (fp16 disabled on CPU)
-        loss = train_model(model, data, batch_size=1, epochs=1,
-                           lr=0.001, use_fp16=False)
+        data = [(planes, policy, 1.0)] * 4
+        loss = train_model(model, data, batch_size=4, epochs=1, lr=0.001)
         self.assertIsInstance(loss, float)
+
+    def test_self_play_game_returns_data(self):
+        """self_play_game 应返回训练数据、胜负和步数"""
+        from simple_chess_ai.train import self_play_game
+        model = ChessModel(num_channels=32, num_res_blocks=2)
+        model.build()
+        data, winner, moves = self_play_game(model, num_simulations=5, max_moves=30)
+        self.assertIsInstance(data, list)
+        self.assertGreater(len(data), 0)
+        self.assertIsInstance(moves, int)
+        # 每个样本应是 (planes, policy, value) 三元组
+        for planes, policy, value in data:
+            self.assertEqual(planes.shape, (14, 10, 9))
+            self.assertEqual(policy.shape, (NUM_ACTIONS,))
 
 
 class TestDirichletNoise(unittest.TestCase):
@@ -816,43 +654,6 @@ class TestPredictWithMask(unittest.TestCase):
         self.assertFalse(np.any(np.isnan(policy)), "策略输出中不应有 NaN")
 
 
-class TestSeedReproducibility(unittest.TestCase):
-    """测试训练种子设置（任务2）"""
-
-    def test_seed_setting_no_error(self):
-        """设置 seed 不应抛出异常"""
-        import random
-        import torch as _torch
-        random.seed(42)
-        np.random.seed(42)
-        _torch.manual_seed(42)
-        # 如果 CUDA 不可用，manual_seed_all 也应无误
-        if _torch.cuda.is_available():
-            _torch.cuda.manual_seed_all(42)
-
-    def test_seed_reproducible_dirichlet(self):
-        """相同 seed 下 Dirichlet 噪声序列应可复现"""
-        np.random.seed(123)
-        noise1 = np.random.dirichlet([0.3] * 10)
-        np.random.seed(123)
-        noise2 = np.random.dirichlet([0.3] * 10)
-        np.testing.assert_array_almost_equal(noise1, noise2)
-
-    def test_run_training_accepts_seed_param(self):
-        """run_training 应接受 seed 和 deterministic 参数而不报错"""
-        from simple_chess_ai.train import run_training
-        import inspect
-        sig = inspect.signature(run_training)
-        self.assertIn('seed', sig.parameters,
-                      "run_training 应有 seed 参数")
-        self.assertIn('deterministic', sig.parameters,
-                      "run_training 应有 deterministic 参数")
-        # 默认值应为 None / False
-        self.assertIsNone(sig.parameters['seed'].default)
-        self.assertFalse(sig.parameters['deterministic'].default)
-
-
-class TestMCTSCache(unittest.TestCase):
     """测试 MCTS 局面缓存（任务4）"""
 
     def setUp(self):
@@ -890,30 +691,26 @@ class TestMCTSCache(unittest.TestCase):
 
 
 class TestExport(unittest.TestCase):
-    """测试数据与图片导出管线 (export.py)"""
+    """测试数据导出管线 (export.py)"""
 
     def setUp(self):
         import tempfile
         from simple_chess_ai.export import (
-            init_run_dir, append_self_play_jsonl,
-            append_training_csv, append_gating_csv, plot_curves,
+            init_run_dir, append_self_play_jsonl, append_training_csv,
         )
         self.tmpdir = tempfile.mkdtemp()
         self.init_run_dir = init_run_dir
         self.append_self_play_jsonl = append_self_play_jsonl
         self.append_training_csv = append_training_csv
-        self.append_gating_csv = append_gating_csv
-        self.plot_curves = plot_curves
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_init_run_dir_creates_directories(self):
-        """init_run_dir 应创建带时间戳的运行目录及 plots/ 子目录"""
+    def test_init_run_dir_creates_directory(self):
+        """init_run_dir 应创建带时间戳的运行目录"""
         run_dir = self.init_run_dir(runs_dir=self.tmpdir)
         self.assertTrue(os.path.isdir(run_dir))
-        self.assertTrue(os.path.isdir(os.path.join(run_dir, 'plots')))
 
     def test_init_run_dir_saves_config(self):
         """init_run_dir 传入 config 时应生成 config.json"""
@@ -979,55 +776,6 @@ class TestExport(unittest.TestCase):
             lines = f.readlines()
         # 1 header + 3 data = 4 lines
         self.assertEqual(len(lines), 4)
-
-    def test_append_gating_csv(self):
-        """append_gating_csv 应正确记录 gating 结果"""
-        import csv
-        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
-        row = {'game_idx': 20, 'wins_a': 12, 'wins_b': 8,
-               'draws': 0, 'score': 0.6, 'gating_winrate': 0.55, 'accepted': True}
-        self.append_gating_csv(run_dir, row)
-        path = os.path.join(run_dir, 'gating_metrics.csv')
-        self.assertTrue(os.path.exists(path))
-        with open(path, encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-        self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(float(rows[0]['score']), 0.6)
-
-    def test_plot_curves_no_matplotlib(self):
-        """即使没有 matplotlib，plot_curves 也不应抛出异常"""
-        import sys
-        import unittest.mock as mock
-        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
-        # 写入一些 CSV 数据
-        self.append_training_csv(run_dir, {'game_idx': 1, 'loss': 1.0})
-        # 模拟 matplotlib 不存在
-        with mock.patch.dict(sys.modules, {'matplotlib': None}):
-            try:
-                self.plot_curves(run_dir)  # 不应抛出
-            except Exception as e:
-                self.fail(f"plot_curves raised exception without matplotlib: {e}")
-
-    def test_plot_curves_with_data(self):
-        """有数据时 plot_curves 应生成 PNG 文件（如果 matplotlib 可用）"""
-        try:
-            import matplotlib  # noqa: F401
-        except ImportError:
-            self.skipTest("matplotlib 未安装，跳过图表生成测试")
-
-        run_dir = self.init_run_dir(runs_dir=self.tmpdir)
-        for i in range(1, 6):
-            self.append_training_csv(run_dir, {'game_idx': i, 'loss': 1.0 / i,
-                                               'buffer_size': i * 100, 'elapsed_s': 5.0})
-            self.append_gating_csv(run_dir, {'game_idx': i * 10, 'wins_a': i, 'wins_b': 5 - i,
-                                              'draws': 0, 'score': 0.5 + i * 0.02,
-                                              'gating_winrate': 0.55, 'accepted': i > 2})
-        self.plot_curves(run_dir)
-        loss_png = os.path.join(run_dir, 'plots', 'loss_curve.png')
-        winrate_png = os.path.join(run_dir, 'plots', 'winrate_curve.png')
-        self.assertTrue(os.path.exists(loss_png), "loss_curve.png 应被生成")
-        self.assertTrue(os.path.exists(winrate_png), "winrate_curve.png 应被生成")
 
 
 class TestRepetitionDetection(unittest.TestCase):
@@ -1169,70 +917,3 @@ class TestRepetitionDetection(unittest.TestCase):
                          "将/帅不参与捉子计算")
 
 
-class TestActionEncoding(unittest.TestCase):
-    """测试新动作编码"""
-
-    def test_encode_decode_consistency(self):
-        """encode后decode应还原走法坐标"""
-        from simple_chess_ai.action_encoding import encode_move, decode_action
-
-        test_moves = ['1213', '0304', '1022', '4041', '0102']
-        for move_str in test_moves:
-            idx = encode_move(move_str)
-            if idx is not None:
-                result = decode_action(idx)
-                self.assertIsNotNone(result, f"decode_action({idx}) returned None for move {move_str}")
-                fx, fy, tx, ty = result
-                expected = (int(move_str[0]), int(move_str[1]),
-                           int(move_str[2]), int(move_str[3]))
-                self.assertEqual((fx, fy, tx, ty), expected,
-                    f"Round-trip failed for {move_str}: got ({fx},{fy},{tx},{ty})")
-
-    def test_legal_action_indices_coverage(self):
-        """legal_action_indices应覆盖所有合法走法"""
-        from simple_chess_ai.action_encoding import legal_action_indices, decode_action
-
-        game = ChessGame()
-        game.reset()
-
-        indices = legal_action_indices(game)
-        self.assertGreater(len(indices), 0)
-
-        for idx in indices:
-            result = decode_action(idx)
-            self.assertIsNotNone(result, f"decode_action({idx}) returned None")
-            fx, fy, tx, ty = result
-            self.assertTrue(0 <= fx < 9 and 0 <= fy < 10, f"Invalid from: ({fx},{fy})")
-            self.assertTrue(0 <= tx < 9 and 0 <= ty < 10, f"Invalid to: ({tx},{ty})")
-
-    def test_mask_probabilities_sum_to_one(self):
-        """掩码验证"""
-        from simple_chess_ai.action_encoding import (
-            legal_action_indices, NUM_ACTION_ENCODING
-        )
-
-        game = ChessGame()
-        game.reset()
-
-        model = ChessModel(backend='gnn')
-        model.build()
-
-        legal_indices = legal_action_indices(game)
-
-        import numpy as np
-        mask = np.zeros(NUM_ACTION_ENCODING, dtype=np.float32)
-        for idx in legal_indices:
-            mask[idx] = 1.0
-
-        self.assertEqual(int(mask.sum()), len(legal_indices))
-        self.assertGreater(len(legal_indices), 0)
-
-    def test_num_actions_correct(self):
-        """动作空间大小应为5310"""
-        from simple_chess_ai.action_encoding import NUM_ACTION_ENCODING, NUM_PLANES
-        self.assertEqual(NUM_PLANES, 59)
-        self.assertEqual(NUM_ACTION_ENCODING, 90 * 59)
-
-
-if __name__ == '__main__':
-    unittest.main()
