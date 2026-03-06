@@ -917,3 +917,287 @@ class TestRepetitionDetection(unittest.TestCase):
                          "将/帅不参与捉子计算")
 
 
+class TestEloUpdate(unittest.TestCase):
+    """测试 ELO 评分更新辅助函数"""
+
+    def test_win_increases_rating(self):
+        """score=1.0（全胜）时评分应上升"""
+        from simple_chess_ai.train import compute_elo_update
+        new_r, delta = compute_elo_update(1500.0, 1500.0, score=1.0, k=32)
+        self.assertGreater(new_r, 1500.0)
+        self.assertGreater(delta, 0.0)
+
+    def test_loss_decreases_rating(self):
+        """score=0.0（全负）时评分应下降"""
+        from simple_chess_ai.train import compute_elo_update
+        new_r, delta = compute_elo_update(1500.0, 1500.0, score=0.0, k=32)
+        self.assertLess(new_r, 1500.0)
+        self.assertLess(delta, 0.0)
+
+    def test_draw_against_equal_no_change(self):
+        """score=0.5 且双方评分相等时，评分几乎不变"""
+        from simple_chess_ai.train import compute_elo_update
+        new_r, delta = compute_elo_update(1500.0, 1500.0, score=0.5, k=32)
+        self.assertAlmostEqual(delta, 0.0, places=6)
+        self.assertAlmostEqual(new_r, 1500.0, places=6)
+
+    def test_k_factor_scales_delta(self):
+        """K 因子应按比例缩放 delta"""
+        from simple_chess_ai.train import compute_elo_update
+        _, delta_k32 = compute_elo_update(1500.0, 1500.0, score=1.0, k=32)
+        _, delta_k16 = compute_elo_update(1500.0, 1500.0, score=1.0, k=16)
+        self.assertAlmostEqual(delta_k32, delta_k16 * 2, places=6)
+
+    def test_elo_formula_known_value(self):
+        """验证具体数值：R_cur=1500, R_opp=1500, score=1.0, k=32 → delta≈16"""
+        from simple_chess_ai.train import compute_elo_update
+        # expected = 1/(1+10^0) = 0.5, delta = 32*(1-0.5) = 16
+        new_r, delta = compute_elo_update(1500.0, 1500.0, score=1.0, k=32)
+        self.assertAlmostEqual(delta, 16.0, places=5)
+        self.assertAlmostEqual(new_r, 1516.0, places=5)
+
+
+class TestEvalModule(unittest.TestCase):
+    """测试独立评测模块（eval.py）"""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_model_file(self):
+        """创建一个临时模型文件，返回路径。"""
+        model = ChessModel(num_channels=32, num_res_blocks=2)
+        model.build()
+        path = os.path.join(self.tmpdir, 'model.pth')
+        model.save(path)
+        return path
+
+    def test_run_eval_returns_structured_result(self):
+        """run_eval 应返回含 wins_a/wins_b/draws/score 的字典"""
+        from simple_chess_ai.eval import run_eval
+        model_path = self._make_model_file()
+        result = run_eval(
+            model_a_path=model_path,
+            model_b_path=model_path,
+            n_games=2,
+            num_simulations=2,
+            max_moves=50,
+            seed=0,
+        )
+        self.assertIn('wins_a', result)
+        self.assertIn('wins_b', result)
+        self.assertIn('draws', result)
+        self.assertIn('score', result)
+        total = result['wins_a'] + result['wins_b'] + result['draws']
+        self.assertEqual(total, 2)
+        self.assertGreaterEqual(result['score'], 0.0)
+        self.assertLessEqual(result['score'], 1.0)
+
+    def test_run_eval_score_consistency(self):
+        """score 应等于 (wins_a + 0.5 * draws) / total"""
+        from simple_chess_ai.eval import run_eval
+        model_path = self._make_model_file()
+        result = run_eval(
+            model_a_path=model_path,
+            model_b_path=model_path,
+            n_games=4,
+            num_simulations=2,
+            max_moves=30,
+            seed=42,
+        )
+        total = result['wins_a'] + result['wins_b'] + result['draws']
+        if total > 0:
+            expected_score = (result['wins_a'] + 0.5 * result['draws']) / total
+            self.assertAlmostEqual(result['score'], expected_score, places=5)
+
+    def test_run_eval_writes_csv_when_out_given(self):
+        """提供 --out 时应在运行目录写入 evaluation_metrics.csv"""
+        import csv as csv_mod
+        from simple_chess_ai.eval import run_eval
+        model_path = self._make_model_file()
+        out_dir = os.path.join(self.tmpdir, 'run_out')
+        run_eval(
+            model_a_path=model_path,
+            model_b_path=model_path,
+            n_games=2,
+            num_simulations=2,
+            max_moves=30,
+            seed=0,
+            out=out_dir,
+        )
+        csv_path = os.path.join(out_dir, 'evaluation_metrics.csv')
+        self.assertTrue(os.path.exists(csv_path),
+                        "evaluation_metrics.csv 应被创建")
+        with open(csv_path, encoding='utf-8') as f:
+            rows = list(csv_mod.DictReader(f))
+        self.assertEqual(len(rows), 1)
+        self.assertIn('score', rows[0])
+
+    def test_run_eval_seed_reproducibility(self):
+        """相同 seed 应产生相同结果"""
+        from simple_chess_ai.eval import run_eval
+        model_path = self._make_model_file()
+        kwargs = dict(
+            model_a_path=model_path,
+            model_b_path=model_path,
+            n_games=2,
+            num_simulations=2,
+            max_moves=30,
+            seed=7,
+        )
+        result1 = run_eval(**kwargs)
+        result2 = run_eval(**kwargs)
+        self.assertEqual(result1['wins_a'], result2['wins_a'])
+        self.assertEqual(result1['wins_b'], result2['wins_b'])
+        self.assertEqual(result1['draws'], result2['draws'])
+
+
+class TestExportEvalHelpers(unittest.TestCase):
+    """测试 export.py 中的评测辅助函数"""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_append_evaluation_csv_creates_file(self):
+        """append_evaluation_csv 应创建 evaluation_metrics.csv 并写入数据"""
+        import csv as csv_mod
+        from simple_chess_ai.export import append_evaluation_csv, init_run_dir
+        run_dir = init_run_dir(runs_dir=self.tmpdir)
+        row = {
+            'game_idx': 10, 'timestamp': '2024-01-01T12:00:00',
+            'opponent': 'previous', 'eval_games': 20, 'eval_sims': 50,
+            'wins': 12, 'losses': 6, 'draws': 2, 'score': 0.65,
+            'elo': 1516.0, 'elo_delta': 16.0,
+        }
+        append_evaluation_csv(run_dir, row)
+        path = os.path.join(run_dir, 'evaluation_metrics.csv')
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding='utf-8') as f:
+            rows = list(csv_mod.DictReader(f))
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(float(rows[0]['elo']), 1516.0)
+
+    def test_load_save_evaluation_state_roundtrip(self):
+        """save/load evaluation_state 应保持数据一致性"""
+        from simple_chess_ai.export import (
+            load_evaluation_state, save_evaluation_state, init_run_dir,
+        )
+        run_dir = init_run_dir(runs_dir=self.tmpdir)
+        state = {'elo_current': 1523.5, 'elo_opponent': 1500.0, 'last_game_idx': 20}
+        save_evaluation_state(run_dir, state)
+        loaded = load_evaluation_state(run_dir)
+        self.assertAlmostEqual(loaded['elo_current'], 1523.5)
+        self.assertEqual(loaded['last_game_idx'], 20)
+
+    def test_load_evaluation_state_defaults_when_missing(self):
+        """evaluation_state.json 不存在时应返回默认初始状态"""
+        from simple_chess_ai.export import load_evaluation_state, init_run_dir
+        run_dir = init_run_dir(runs_dir=self.tmpdir)
+        state = load_evaluation_state(run_dir)
+        self.assertIn('elo_current', state)
+        self.assertIn('elo_opponent', state)
+        self.assertAlmostEqual(state['elo_current'], 1500.0)
+
+
+class TestPlotModule(unittest.TestCase):
+    """测试绘图模块（plot.py）"""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_csv(self, filename, rows):
+        import csv as csv_mod
+        path = os.path.join(self.tmpdir, filename)
+        if rows:
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv_mod.DictWriter(f, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+        return path
+
+    def test_plot_missing_matplotlib_exits(self):
+        """matplotlib 未安装时 _require_matplotlib 应触发 SystemExit"""
+        import sys
+        import importlib
+        from unittest.mock import patch
+        # 模拟 matplotlib 不可用
+        with patch.dict(sys.modules, {'matplotlib': None, 'matplotlib.pyplot': None}):
+            from simple_chess_ai import plot as plot_mod
+            importlib.reload(plot_mod)
+            with self.assertRaises(SystemExit):
+                plot_mod._require_matplotlib()
+
+    def test_plot_loss_no_data_skips(self):
+        """training_metrics.csv 不存在时 plot_loss 应跳过（返回 None）"""
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib 未安装，跳过绘图测试")
+        from simple_chess_ai.plot import plot_loss
+        result = plot_loss(self.tmpdir, self.tmpdir, fmt='png')
+        self.assertIsNone(result)
+
+    def test_plot_loss_generates_file(self):
+        """有数据时 plot_loss 应生成 loss.png"""
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib 未安装，跳过绘图测试")
+        from simple_chess_ai.plot import plot_loss
+        self._write_csv('training_metrics.csv', [
+            {'game_idx': 1, 'loss': 2.5},
+            {'game_idx': 2, 'loss': 2.1},
+        ])
+        out_path = plot_loss(self.tmpdir, self.tmpdir, fmt='png')
+        self.assertIsNotNone(out_path)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertTrue(out_path.endswith('loss.png'))
+
+    def test_plot_elo_generates_file(self):
+        """有数据时 plot_elo 应生成 elo.png"""
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib 未安装，跳过绘图测试")
+        from simple_chess_ai.plot import plot_elo
+        self._write_csv('evaluation_metrics.csv', [
+            {'game_idx': 10, 'elo': 1510.0, 'score': 0.6},
+            {'game_idx': 20, 'elo': 1525.0, 'score': 0.65},
+        ])
+        out_path = plot_elo(self.tmpdir, self.tmpdir, fmt='png')
+        self.assertIsNotNone(out_path)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertTrue(out_path.endswith('elo.png'))
+
+    def test_plot_score_generates_file(self):
+        """有数据时 plot_score 应生成 score.png"""
+        try:
+            import matplotlib  # noqa: F401
+        except ImportError:
+            self.skipTest("matplotlib 未安装，跳过绘图测试")
+        from simple_chess_ai.plot import plot_score
+        self._write_csv('evaluation_metrics.csv', [
+            {'game_idx': 10, 'elo': 1510.0, 'score': 0.6},
+            {'game_idx': 20, 'elo': 1525.0, 'score': 0.65},
+        ])
+        out_path = plot_score(self.tmpdir, self.tmpdir, fmt='png')
+        self.assertIsNotNone(out_path)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertTrue(out_path.endswith('score.png'))
+
+
+
