@@ -4,11 +4,9 @@
 用法:
     训练模型:
         python -m simple_chess_ai train [--num_games 50] [--num_simulations 100]
-        python -m simple_chess_ai train --use_grpo [--grpo_group_size 8]
-        python -m simple_chess_ai train --use_fp16
 
     图形界面对弈:
-        python -m simple_chess_ai play [--model_path path/to/model.pth] [--num_simulations 200]
+        python -m simple_chess_ai play [--model_path path/to/model.pth]
 
     命令行对弈:
         python -m simple_chess_ai play_cli [--model_path path/to/model.pth]
@@ -26,7 +24,6 @@ def main():
     parser.add_argument('command', choices=['train', 'play', 'play_cli'],
                         help='命令: train(训练), play(图形界面), play_cli(命令行)')
 
-    # 解析第一个参数
     args, remaining = parser.parse_known_args()
 
     if args.command == 'train':

@@ -6,28 +6,19 @@
 2. 训练：用生成的数据训练神经网络
 3. 循环：重复以上步骤持续提升
 
-支持训练模式：
-- 标准训练（原版AlphaZero策略）
-- GRPO训练（Group Relative Policy Optimization）
-- FP16混合精度训练
-
 用法：
-    python -m simple_chess_ai.train --num_games 100 --num_epochs 10
-    python -m simple_chess_ai.train --num_games 100 --use_grpo
-    python -m simple_chess_ai.train --num_games 100 --use_fp16
+    python -m simple_chess_ai train --num_games 50 --num_simulations 100
 """
 
 import os
 import json
 import time
-import copy
 import argparse
 import datetime
 import numpy as np
 from collections import deque
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -38,42 +29,28 @@ from simple_chess_ai.game import (
 from simple_chess_ai.model import ChessModel
 from simple_chess_ai.mcts import MCTS
 from simple_chess_ai.export import (
-    init_run_dir, append_self_play_jsonl,
-    append_training_csv, append_gating_csv, plot_curves,
-    DEFAULT_RUNS_DIR,
+    init_run_dir, append_self_play_jsonl, append_training_csv,
 )
 
 # 默认模型保存路径
 DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(__file__), 'saved_model')
 DEFAULT_MODEL_PATH = os.path.join(DEFAULT_MODEL_DIR, 'model.pth')
-DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), 'train_data')
 
 
 def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=200):
     """
     通过对局评测两个模型，返回 model_a 的 score（draw=0.5 计分）。
 
-    对弈时禁用 Dirichlet 噪声，使用温度=0 的确定性走法，
-    并交替红黑方以减少先手优势偏差。
-    score = (wins_a + 0.5 * draws) / total
-
-    Args:
-        model_a: 候选新模型
-        model_b: 基准模型
-        n_games: 对局数
-        num_simulations: MCTS模拟次数
-        max_moves: 每局最大步数
+    可作为独立工具函数使用，不在主训练循环中自动调用。
 
     Returns:
         (score, wins_a, wins_b, draws)
-        其中 score = (wins_a + 0.5 * draws) / total，draw 计 0.5 分
     """
     wins_a = 0
     wins_b = 0
     draws = 0
 
     for game_idx in range(n_games):
-        # 交替先手以减少先手优势偏差
         if game_idx % 2 == 0:
             red_model, black_model = model_a, model_b
             a_is_red = True
@@ -131,21 +108,18 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
 
     states = []
     policies = []
-    players = []  # 记录每步的走子方
+    players = []
 
     move_count = 0
 
     while not game.done and move_count < max_moves:
-        # 温度控制
         temperature = 1.0 if move_count < temperature_threshold else 0.1
 
-        # MCTS搜索
         actions, probs = mcts.get_action_probs(game, temperature=temperature, add_noise=True)
 
         if not actions:
             break
 
-        # 记录训练数据
         planes = game.to_planes()
         policy_target = np.zeros(NUM_ACTIONS, dtype=np.float32)
         for action, prob in zip(actions, probs):
@@ -156,11 +130,9 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
         policies.append(policy_target)
         players.append(1 if game.red_to_move else -1)
 
-        # 按概率选择走法
         action_idx = np.random.choice(len(actions), p=probs)
         chosen_action = actions[action_idx]
 
-        # 执行走法
         if not game.red_to_move:
             actual_action = flip_move(chosen_action)
         else:
@@ -170,7 +142,6 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
 
         move_count += 1
 
-    # 确定胜负
     if game.winner == 'red':
         winner = 1
     elif game.winner == 'black':
@@ -178,17 +149,15 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
     else:
         winner = 0
 
-    # 生成训练数据
     training_data = []
     for state, policy, player in zip(states, policies, players):
-        value = winner * player  # 从该玩家视角的评估值
+        value = winner * player
         training_data.append((state, policy, value))
 
     return training_data, game.winner, move_count
 
 
-def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
-                use_fp16=False):
+def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
     """
     用训练数据训练模型
 
@@ -198,7 +167,6 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
         batch_size: 批大小
         epochs: 训练轮数
         lr: 学习率
-        use_fp16: 是否使用FP16混合精度训练
 
     Returns:
         avg_loss: 平均损失
@@ -206,7 +174,6 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
     if not training_data:
         return 0.0
 
-    # 准备数据
     states = np.array([d[0] for d in training_data])
     policies = np.array([d[1] for d in training_data])
     values = np.array([d[2] for d in training_data], dtype=np.float32)
@@ -218,13 +185,8 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    # 设置训练模式
     model.model.train()
     optimizer = optim.Adam(model.model.parameters(), lr=lr, weight_decay=1e-4)
-
-    # FP16 混合精度
-    amp_enabled = use_fp16 and model.device.type == 'cuda'
-    scaler = torch.amp.GradScaler('cuda') if amp_enabled else None
 
     total_loss = 0.0
     num_batches = 0
@@ -235,28 +197,20 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
             batch_policies = batch_policies.to(model.device)
             batch_values = batch_values.to(model.device)
 
-            with torch.amp.autocast('cuda', enabled=amp_enabled):
-                # 前向传播；模型输出 logits（策略头不含 softmax）
-                pred_logits, pred_values = model.model(batch_states)
+            pred_logits, pred_values = model.model(batch_states)
 
-                # 策略损失：交叉熵（用 log_softmax 数值更稳定，避免 log(softmax+eps)）
-                policy_loss = -torch.mean(
-                    torch.sum(batch_policies * torch.nn.functional.log_softmax(pred_logits, dim=1), dim=1)
-                )
-                # 价值损失：均方误差
-                value_loss = torch.mean((batch_values - pred_values.squeeze()) ** 2)
-                # 总损失
-                loss = policy_loss + value_loss
+            # 策略损失：交叉熵
+            policy_loss = -torch.mean(
+                torch.sum(batch_policies * torch.nn.functional.log_softmax(pred_logits, dim=1), dim=1)
+            )
+            # 价值损失：均方误差
+            value_loss = torch.mean((batch_values - pred_values.squeeze()) ** 2)
+            loss = policy_loss + value_loss
 
             optimizer.zero_grad()
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
-                optimizer.step()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.model.parameters(), max_norm=1.0)
+            optimizer.step()
 
             total_loss += loss.item()
             num_batches += 1
@@ -265,24 +219,10 @@ def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001,
     return total_loss / max(num_batches, 1)
 
 
-def _save_training_config(model_path, config):
-    """将训练配置写入 saved_model/config.json，方便复现与追溯。"""
-    import datetime
-    model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
-    os.makedirs(model_dir, exist_ok=True)
-    config['_start_time'] = datetime.datetime.now().isoformat(timespec='seconds')
-    config_path = os.path.join(model_dir, 'config.json')
-    with open(config_path, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-    print(f"训练配置已保存到: {config_path}")
-
-
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
                  buffer_size=10000, model_path=None, save_interval=10,
-                 use_grpo=False, grpo_group_size=8, use_fp16=False,
-                 gating_interval=20, gating_games=20, gating_winrate=0.55,
-                 seed=None, deterministic=False, runs_dir=None, quick=False):
+                 quick=False):
     """
     运行完整的训练流程
 
@@ -296,116 +236,59 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         buffer_size: 训练数据缓冲区大小
         model_path: 模型保存路径
         save_interval: 每隔多少局保存一次模型
-        use_grpo: 是否使用GRPO训练
-        grpo_group_size: GRPO组采样大小
-        use_fp16: 是否使用FP16混合精度训练
-        gating_interval: 每隔多少局进行一次 gating 评测（0 表示禁用）
-        gating_games: gating 评测对局数
-        gating_winrate: gating 接受阈值（新模型胜率需超过此值）
-        seed: 随机种子（None 表示不固定）
-        deterministic: 是否启用 cuDNN 确定性模式（可能降低训练速度）
-        runs_dir: 日志与数据导出根目录（默认 simple_chess_ai/runs/，None 表示使用默认）
+        quick: 快速模式，用于验证流程
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
 
-    # 快速模式：减少训练量以快速验证流程
     if quick:
         num_games = 1
         num_simulations = 10
         num_epochs = 1
         batch_size = 16
-        gating_interval = 0
         max_moves = 50
 
-    # best 模型路径 = model_path；周期性保存使用同目录下的 last.pth
     model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
-    last_model_path = os.path.join(model_dir, 'last.pth')
-
-    # ── 可复现性：设置随机种子 ──────────────────────────────────────────────
-    if seed is not None:
-        import random
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        if deterministic:
-            # 启用 cuDNN 确定性选项；注意可能降低训练速度
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
 
     # 初始化模型
-    model = ChessModel(num_channels=128, num_res_blocks=4, backend='gnn')
+    model = ChessModel(num_channels=128, num_res_blocks=4)
     if os.path.exists(model_path):
         print(f"加载已有模型: {model_path}")
         model.load(model_path)
     else:
         print("创建新模型")
         model.build()
-        # best 模型文件不存在时，用随机初始化的模型作为初始 best 并保存
         os.makedirs(model_dir, exist_ok=True)
         model.save(model_path)
-        print(f"初始化 best 模型已保存到: {model_path}")
+        print(f"初始模型已保存到: {model_path}")
 
-    # 保存本次训练的配置（供复现/追溯）
+    # 初始化数据导出目录
     training_config = dict(
         num_games=num_games, num_simulations=num_simulations,
         num_epochs=num_epochs, batch_size=batch_size, lr=lr,
         max_moves=max_moves, buffer_size=buffer_size,
-        save_interval=save_interval, use_grpo=use_grpo,
-        grpo_group_size=grpo_group_size, use_fp16=use_fp16,
-        gating_interval=gating_interval, gating_games=gating_games,
-        gating_winrate=gating_winrate, seed=seed,
-        deterministic=deterministic,
     )
-    _save_training_config(model_path, training_config)
+    run_dir = init_run_dir(config=training_config)
+    print(f"日志目录: {run_dir}")
 
-    # ── 初始化数据导出目录 ────────────────────────────────────────────────────
-    run_dir = init_run_dir(runs_dir=runs_dir, config=training_config)
-    print(f"数据导出目录: {run_dir}")
-
-    # 记录 best 模型权重（仅用于 gating 对比，不回滚训练）
-    best_model_state = copy.deepcopy(model.model.state_dict())
-
-    # GRPO 训练器
-    grpo_trainer = None
-    if use_grpo:
-        from simple_chess_ai.grpo import GRPOTrainer
-        grpo_trainer = GRPOTrainer(
-            model, group_size=grpo_group_size,
-            lr=lr, use_fp16=use_fp16
-        )
-
-    # 训练数据缓冲区
     data_buffer = deque(maxlen=buffer_size)
-
     stats = {'red_wins': 0, 'black_wins': 0, 'draws': 0}
 
-    training_mode = "GRPO" if use_grpo else "Standard"
-    fp16_str = " + FP16" if use_fp16 else ""
-
     print(f"\n{'='*60}")
-    print(f"开始训练 ({training_mode}{fp16_str})")
+    print(f"开始训练")
     print(f"自对弈局数: {num_games}")
     print(f"MCTS模拟次数: {num_simulations}")
-    if use_grpo:
-        print(f"GRPO组大小: {grpo_group_size}")
-    if gating_interval > 0:
-        print(f"Gating: 每 {gating_interval} 局评测 {gating_games} 局, 阈值 {gating_winrate:.0%}")
     print(f"模型保存路径: {model_path}")
     print(f"{'='*60}\n")
 
     for game_idx in range(1, num_games + 1):
         start_time = time.time()
 
-        # 自对弈
         data, winner, moves = self_play_game(
             model, num_simulations=num_simulations, max_moves=max_moves
         )
         data_buffer.extend(data)
 
-        # 统计
         if winner == 'red':
             stats['red_wins'] += 1
         elif winner == 'black':
@@ -417,11 +300,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         print(f"[第 {game_idx}/{num_games} 局] "
               f"胜方: {winner or '和棋'}, "
               f"步数: {moves}, "
-              f"新增数据: {len(data)}, "
               f"缓冲区: {len(data_buffer)}, "
               f"耗时: {elapsed:.1f}s")
 
-        # ── 自对弈记录落盘（JSONL）──────────────────────────────────────────
         append_self_play_jsonl(run_dir, {
             'game_idx': game_idx,
             'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -431,42 +312,15 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
             'elapsed_s': round(elapsed, 2),
         })
 
-        # 训练（每局都训练，但数据足够时才有效）
         avg_loss = 0.0
         if len(data_buffer) >= batch_size:
-            if use_grpo and grpo_trainer is not None:
-                # GRPO 训练模式：使用轨迹数据和真实回报z
-                if len(data_buffer) >= batch_size:
-                    import random as _random
-                    batch_data = _random.sample(list(data_buffer), min(batch_size, len(data_buffer)))
-                    b_states = np.array([d[0] for d in batch_data])
-                    b_policies = np.array([d[1] for d in batch_data])
-                    b_values = np.array([d[2] for d in batch_data], dtype=np.float32)
+            train_data = list(data_buffer)
+            avg_loss = train_model(
+                model, train_data, batch_size=batch_size,
+                epochs=num_epochs, lr=lr
+            )
+            print(f"  训练完成，平均损失: {avg_loss:.4f}")
 
-                    # 构建合法走法掩码（用策略分布的非零项作为代理）
-                    b_masks = (b_policies > 0).astype(np.float32)
-                    # 取策略分布中概率最大的动作
-                    b_actions = np.argmax(b_policies, axis=1)
-
-                    grpo_metrics = grpo_trainer.train_step_from_trajectory(
-                        b_states, b_masks, b_actions, b_policies, b_values
-                    )
-                    avg_loss = grpo_metrics.get('loss', 0.0)
-                    print(f"  GRPO训练完成，损失: {grpo_metrics['loss']:.4f}, "
-                          f"策略损失: {grpo_metrics['policy_loss']:.4f}")
-                else:
-                    avg_loss = 0.0
-            else:
-                # 标准训练模式
-                train_data = list(data_buffer)
-                avg_loss = train_model(
-                    model, train_data, batch_size=batch_size,
-                    epochs=num_epochs, lr=lr, use_fp16=use_fp16
-                )
-                print(f"  训练完成，平均损失: {avg_loss:.4f}")
-
-        # ── 训练指标落盘（CSV）──────────────────────────────────────────────
-        if len(data_buffer) >= batch_size:
             append_training_csv(run_dir, {
                 'game_idx': game_idx,
                 'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -475,67 +329,18 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 'elapsed_s': round(elapsed, 2),
             })
 
-        # 定期保存模型（候选模型保存为 last.pth，不覆盖 best）
         if game_idx % save_interval == 0:
-            model.save(last_model_path)
-            print(f"  候选模型已保存到: {last_model_path}")
+            model.save(model_path)
+            print(f"  模型已保存到: {model_path}")
 
-        # Gating：定期评测新模型 vs 基准模型
-        if gating_interval > 0 and game_idx % gating_interval == 0:
-            print(f"  [Gating] 开始评测 (第 {game_idx} 局后)...")
-            ref_model = ChessModel(
-                num_channels=model.num_channels,
-                num_res_blocks=model.num_res_blocks
-            )
-            ref_model.build()
-            ref_model.model.load_state_dict(copy.deepcopy(best_model_state))
-            ref_model.model.eval()
-
-            score, wins, losses, draws_g = evaluate_models(
-                model, ref_model,
-                n_games=gating_games,
-                num_simulations=max(num_simulations // 2, 20),
-                max_moves=max_moves
-            )
-            print(f"  [Gating] 胜 {wins} / 负 {losses} / 和 {draws_g}, "
-                  f"score: {score:.0%}, 阈值: {gating_winrate:.0%}")
-            if score > gating_winrate:
-                print(f"  [Gating] ✓ 新模型被接受，更新 best 模型")
-                best_model_state = copy.deepcopy(model.model.state_dict())
-                model.save(model_path)
-                print(f"  [Gating] best 模型已保存到: {model_path}")
-                gating_accepted = True
-            else:
-                print(f"  [Gating] ✗ 新模型未超过阈值，best 模型不变，训练继续")
-                gating_accepted = False
-
-            # ── Gating 评测结果落盘（CSV）────────────────────────────────────
-            append_gating_csv(run_dir, {
-                'game_idx': game_idx,
-                'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
-                'wins_a': wins,
-                'wins_b': losses,
-                'draws': draws_g,
-                'score': round(score, 4),
-                'gating_winrate': gating_winrate,
-                'accepted': gating_accepted,
-            })
-
-    # 最终保存候选模型（best 已在 gating 通过时实时更新到 model_path）
-    model.save(last_model_path)
+    model.save(model_path)
     print(f"\n{'='*60}")
     print(f"训练完成！")
     print(f"红方胜: {stats['red_wins']}, "
           f"黑方胜: {stats['black_wins']}, "
           f"和棋: {stats['draws']}")
-    print(f"最终候选模型已保存到: {last_model_path}")
-    print(f"best 模型路径: {model_path}")
-    print(f"数据导出目录: {run_dir}")
-
-    # ── 自动生成图表 ─────────────────────────────────────────────────────────
-    print("正在生成训练曲线图...")
-    plot_curves(run_dir)
-
+    print(f"模型已保存到: {model_path}")
+    print(f"日志目录: {run_dir}")
     print(f"{'='*60}")
 
 
@@ -553,32 +358,10 @@ def main():
                         help='学习率 (默认: 0.001)')
     parser.add_argument('--max_moves', type=int, default=200,
                         help='每局最大步数 (默认: 200)')
-    parser.add_argument('--buffer_size', type=int, default=10000,
-                        help='训练数据缓冲区大小 (默认: 10000)')
     parser.add_argument('--model_path', type=str, default=None,
                         help='模型保存路径')
-    parser.add_argument('--save_interval', type=int, default=10,
-                        help='每隔多少局保存模型 (默认: 10)')
-    parser.add_argument('--use_grpo', action='store_true',
-                        help='使用GRPO训练模式')
-    parser.add_argument('--grpo_group_size', type=int, default=8,
-                        help='GRPO组采样大小 (默认: 8)')
-    parser.add_argument('--use_fp16', action='store_true',
-                        help='使用FP16混合精度训练')
-    parser.add_argument('--gating_interval', type=int, default=20,
-                        help='每隔多少局进行 gating 评测，0 表示禁用 (默认: 20)')
-    parser.add_argument('--gating_games', type=int, default=20,
-                        help='gating 评测对局数 (默认: 20)')
-    parser.add_argument('--gating_winrate', type=float, default=0.55,
-                        help='gating 接受阈值，新模型胜率需超过此值 (默认: 0.55)')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='随机种子，设置后可复现数据生成序列 (默认: None)')
-    parser.add_argument('--deterministic', action='store_true',
-                        help='开启 cuDNN 确定性模式（配合 --seed 使用，可能降低训练速度）')
-    parser.add_argument('--runs_dir', type=str, default=None,
-                        help=f'数据与日志导出根目录 (默认: simple_chess_ai/runs/)')
     parser.add_argument('--quick', action='store_true',
-                        help='快速模式：1局自对弈+1次参数更新，用于验证流程')
+                        help='快速模式：1局+1次训练，用于验证流程')
 
     args = parser.parse_args()
     run_training(**vars(args))
