@@ -6,7 +6,7 @@
 
 默认输出目录结构::
 
-    simple_chess_ai/runs/<run_YYYYMMDD_HHMMSS>/
+    AIchess/runs/<run_YYYYMMDD_HHMMSS>/
         config.json              训练超参数及元信息
         self_play.jsonl          每局自对弈记录（每行一个 JSON 对象）
         training_metrics.csv     训练指标（game_idx、loss、buffer_size 等）
@@ -29,7 +29,7 @@ def init_run_dir(runs_dir=None, config=None):
     初始化带时间戳的运行目录，保存训练配置。
 
     Args:
-        runs_dir (str | None): 根目录路径。默认为 ``simple_chess_ai/runs/``。
+        runs_dir (str | None): 根目录路径。默认为 ``AIchess/runs/``。
         config (dict | None): 训练配置字典，写入 ``config.json``；为 ``None`` 时跳过。
 
     Returns:

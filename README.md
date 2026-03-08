@@ -14,7 +14,7 @@
 ## 目录结构
 
 ```
-simple_chess_ai/
+AIchess/
 ├── __init__.py        # 包初始化
 ├── __main__.py        # 主入口（train / play / play_cli / eval / plot）
 ├── game.py            # 完整中国象棋规则与状态管理
@@ -50,13 +50,13 @@ pip install matplotlib    # 可选，训练曲线绘图
 
 ```bash
 # 默认训练（50 局自对弈）
-python -m simple_chess_ai train
+python -m AIchess train
 
 # 自定义参数
-python -m simple_chess_ai train --num_games 100 --num_simulations 200
+python -m AIchess train --num_games 100 --num_simulations 200
 
 # 快速验证流程（1 局 + 1 次训练）
-python -m simple_chess_ai train --quick
+python -m AIchess train --quick
 ```
 
 ### 2. 带评测的训练
@@ -66,7 +66,7 @@ python -m simple_chess_ai train --quick
 
 ```bash
 # 每 10 局对战上一基准模型评测一次
-python -m simple_chess_ai train \
+python -m AIchess train \
     --num_games 100 \
     --eval_interval 10 \
     --eval_games 20 \
@@ -79,19 +79,19 @@ python -m simple_chess_ai train \
 
 ```bash
 # 图形界面（需要 Pygame）
-python -m simple_chess_ai play --model_path saved_model/model.pth
+python -m AIchess play --model_path saved_model/model.pth
 
 # 命令行界面
-python -m simple_chess_ai play_cli --model_path saved_model/model.pth
+python -m AIchess play_cli --model_path saved_model/model.pth
 
 # 执黑方
-python -m simple_chess_ai play --human_color black
+python -m AIchess play --human_color black
 ```
 
 ### 4. 独立模型评测
 
 ```bash
-python -m simple_chess_ai eval \
+python -m AIchess eval \
     --model_a saved_model/model_v1.pth \
     --model_b saved_model/model_v2.pth \
     --n_games 200 \
@@ -111,7 +111,7 @@ python -m simple_chess_ai eval \
 ### 5. 绘制训练曲线
 
 ```bash
-python -m simple_chess_ai plot \
+python -m AIchess plot \
     --run_dir runs/run_20240101_120000 \
     --out_dir runs/run_20240101_120000/plots \
     --format png
@@ -223,6 +223,6 @@ R_cur_new = R_cur + K × (S - expected)
 ## 运行测试
 
 ```bash
-cd ..  # 进入 simple_chess_ai 包的父目录
-python -m unittest simple_chess_ai.tests -v
+cd ..  # 进入 AIchess 包的父目录
+python -m unittest AIchess.tests -v
 ```

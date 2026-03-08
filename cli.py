@@ -4,7 +4,7 @@
 纯文本界面的人机对弈模式。
 
 用法:
-    python -m simple_chess_ai play_cli [--model_path path/to/model.pth]
+    python -m AIchess play_cli [--model_path path/to/model.pth]
 """
 
 import os
@@ -12,9 +12,9 @@ import sys
 import argparse
 import numpy as np
 
-from simple_chess_ai.game import ChessGame, flip_move
-from simple_chess_ai.model import ChessModel
-from simple_chess_ai.mcts import MCTS
+from .game import ChessGame, flip_move
+from .model import ChessModel
+from .mcts import MCTS
 
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'saved_model', 'model.pth')
 

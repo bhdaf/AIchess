@@ -8,13 +8,13 @@ import unittest
 import os
 import numpy as np
 
-from simple_chess_ai.game import (
+from .game import (
     ChessGame, ACTION_LABELS, LABEL_TO_INDEX, NUM_ACTIONS,
     BOARD_HEIGHT, BOARD_WIDTH, INIT_FEN, fen_to_planes,
     flip_move, flip_policy
 )
-from simple_chess_ai.model import ChessModel
-from simple_chess_ai.mcts import MCTS, MCTSNode
+from .model import ChessModel
+from .mcts import MCTS, MCTSNode
 
 
 class TestGameInit(unittest.TestCase):
@@ -371,7 +371,7 @@ class TestTraining(unittest.TestCase):
 
     def test_train_model_runs(self):
         """train_model 用少量样本跑一个 epoch 不应报错"""
-        from simple_chess_ai.train import train_model
+        from .train import train_model
         model = ChessModel(num_channels=32, num_res_blocks=2)
         model.build()
         game = ChessGame()
@@ -385,7 +385,7 @@ class TestTraining(unittest.TestCase):
 
     def test_self_play_game_returns_data(self):
         """self_play_game 应返回训练数据、胜负和步数"""
-        from simple_chess_ai.train import self_play_game
+        from .train import self_play_game
         model = ChessModel(num_channels=32, num_res_blocks=2)
         model.build()
         data, winner, moves = self_play_game(model, num_simulations=5, max_moves=30)
@@ -532,7 +532,7 @@ class TestEvaluateModels(unittest.TestCase):
 
     def test_evaluate_returns_valid_stats(self):
         """evaluate_models 返回合法的 score（draw=0.5）和统计"""
-        from simple_chess_ai.train import evaluate_models
+        from .train import evaluate_models
         model_a = ChessModel(num_channels=32, num_res_blocks=2)
         model_a.build()
         model_b = ChessModel(num_channels=32, num_res_blocks=2)
@@ -695,7 +695,7 @@ class TestExport(unittest.TestCase):
 
     def setUp(self):
         import tempfile
-        from simple_chess_ai.export import (
+        from .export import (
             init_run_dir, append_self_play_jsonl, append_training_csv,
         )
         self.tmpdir = tempfile.mkdtemp()
@@ -922,35 +922,35 @@ class TestEloUpdate(unittest.TestCase):
 
     def test_win_increases_rating(self):
         """score=1.0（全胜）时评分应上升"""
-        from simple_chess_ai.train import compute_elo_update
+        from .train import compute_elo_update
         new_r, delta = compute_elo_update(1500.0, 1500.0, score=1.0, k=32)
         self.assertGreater(new_r, 1500.0)
         self.assertGreater(delta, 0.0)
 
     def test_loss_decreases_rating(self):
         """score=0.0（全负）时评分应下降"""
-        from simple_chess_ai.train import compute_elo_update
+        from .train import compute_elo_update
         new_r, delta = compute_elo_update(1500.0, 1500.0, score=0.0, k=32)
         self.assertLess(new_r, 1500.0)
         self.assertLess(delta, 0.0)
 
     def test_draw_against_equal_no_change(self):
         """score=0.5 且双方评分相等时，评分几乎不变"""
-        from simple_chess_ai.train import compute_elo_update
+        from .train import compute_elo_update
         new_r, delta = compute_elo_update(1500.0, 1500.0, score=0.5, k=32)
         self.assertAlmostEqual(delta, 0.0, places=6)
         self.assertAlmostEqual(new_r, 1500.0, places=6)
 
     def test_k_factor_scales_delta(self):
         """K 因子应按比例缩放 delta"""
-        from simple_chess_ai.train import compute_elo_update
+        from .train import compute_elo_update
         _, delta_k32 = compute_elo_update(1500.0, 1500.0, score=1.0, k=32)
         _, delta_k16 = compute_elo_update(1500.0, 1500.0, score=1.0, k=16)
         self.assertAlmostEqual(delta_k32, delta_k16 * 2, places=6)
 
     def test_elo_formula_known_value(self):
         """验证具体数值：R_cur=1500, R_opp=1500, score=1.0, k=32 → delta≈16"""
-        from simple_chess_ai.train import compute_elo_update
+        from .train import compute_elo_update
         # expected = 1/(1+10^0) = 0.5, delta = 32*(1-0.5) = 16
         new_r, delta = compute_elo_update(1500.0, 1500.0, score=1.0, k=32)
         self.assertAlmostEqual(delta, 16.0, places=5)
@@ -978,7 +978,7 @@ class TestEvalModule(unittest.TestCase):
 
     def test_run_eval_returns_structured_result(self):
         """run_eval 应返回含 wins_a/wins_b/draws/score 的字典"""
-        from simple_chess_ai.eval import run_eval
+        from .eval import run_eval
         model_path = self._make_model_file()
         result = run_eval(
             model_a_path=model_path,
@@ -999,7 +999,7 @@ class TestEvalModule(unittest.TestCase):
 
     def test_run_eval_score_consistency(self):
         """score 应等于 (wins_a + 0.5 * draws) / total"""
-        from simple_chess_ai.eval import run_eval
+        from .eval import run_eval
         model_path = self._make_model_file()
         result = run_eval(
             model_a_path=model_path,
@@ -1017,7 +1017,7 @@ class TestEvalModule(unittest.TestCase):
     def test_run_eval_writes_csv_when_out_given(self):
         """提供 --out 时应在运行目录写入 evaluation_metrics.csv"""
         import csv as csv_mod
-        from simple_chess_ai.eval import run_eval
+        from .eval import run_eval
         model_path = self._make_model_file()
         out_dir = os.path.join(self.tmpdir, 'run_out')
         run_eval(
@@ -1039,7 +1039,7 @@ class TestEvalModule(unittest.TestCase):
 
     def test_run_eval_seed_reproducibility(self):
         """相同 seed 应产生相同结果"""
-        from simple_chess_ai.eval import run_eval
+        from .eval import run_eval
         model_path = self._make_model_file()
         kwargs = dict(
             model_a_path=model_path,
@@ -1070,7 +1070,7 @@ class TestExportEvalHelpers(unittest.TestCase):
     def test_append_evaluation_csv_creates_file(self):
         """append_evaluation_csv 应创建 evaluation_metrics.csv 并写入数据"""
         import csv as csv_mod
-        from simple_chess_ai.export import append_evaluation_csv, init_run_dir
+        from .export import append_evaluation_csv, init_run_dir
         run_dir = init_run_dir(runs_dir=self.tmpdir)
         row = {
             'game_idx': 10, 'timestamp': '2024-01-01T12:00:00',
@@ -1088,7 +1088,7 @@ class TestExportEvalHelpers(unittest.TestCase):
 
     def test_load_save_evaluation_state_roundtrip(self):
         """save/load evaluation_state 应保持数据一致性"""
-        from simple_chess_ai.export import (
+        from .export import (
             load_evaluation_state, save_evaluation_state, init_run_dir,
         )
         run_dir = init_run_dir(runs_dir=self.tmpdir)
@@ -1100,7 +1100,7 @@ class TestExportEvalHelpers(unittest.TestCase):
 
     def test_load_evaluation_state_defaults_when_missing(self):
         """evaluation_state.json 不存在时应返回默认初始状态"""
-        from simple_chess_ai.export import load_evaluation_state, init_run_dir
+        from .export import load_evaluation_state, init_run_dir
         run_dir = init_run_dir(runs_dir=self.tmpdir)
         state = load_evaluation_state(run_dir)
         self.assertIn('elo_current', state)
@@ -1136,7 +1136,7 @@ class TestPlotModule(unittest.TestCase):
         from unittest.mock import patch
         # 模拟 matplotlib 不可用
         with patch.dict(sys.modules, {'matplotlib': None, 'matplotlib.pyplot': None}):
-            from simple_chess_ai import plot as plot_mod
+            from . import plot as plot_mod
             importlib.reload(plot_mod)
             with self.assertRaises(SystemExit):
                 plot_mod._require_matplotlib()
@@ -1147,7 +1147,7 @@ class TestPlotModule(unittest.TestCase):
             import matplotlib  # noqa: F401
         except ImportError:
             self.skipTest("matplotlib 未安装，跳过绘图测试")
-        from simple_chess_ai.plot import plot_loss
+        from .plot import plot_loss
         result = plot_loss(self.tmpdir, self.tmpdir, fmt='png')
         self.assertIsNone(result)
 
@@ -1157,7 +1157,7 @@ class TestPlotModule(unittest.TestCase):
             import matplotlib  # noqa: F401
         except ImportError:
             self.skipTest("matplotlib 未安装，跳过绘图测试")
-        from simple_chess_ai.plot import plot_loss
+        from .plot import plot_loss
         self._write_csv('training_metrics.csv', [
             {'game_idx': 1, 'loss': 2.5},
             {'game_idx': 2, 'loss': 2.1},
@@ -1173,7 +1173,7 @@ class TestPlotModule(unittest.TestCase):
             import matplotlib  # noqa: F401
         except ImportError:
             self.skipTest("matplotlib 未安装，跳过绘图测试")
-        from simple_chess_ai.plot import plot_elo
+        from .plot import plot_elo
         self._write_csv('evaluation_metrics.csv', [
             {'game_idx': 10, 'elo': 1510.0, 'score': 0.6},
             {'game_idx': 20, 'elo': 1525.0, 'score': 0.65},
@@ -1189,7 +1189,7 @@ class TestPlotModule(unittest.TestCase):
             import matplotlib  # noqa: F401
         except ImportError:
             self.skipTest("matplotlib 未安装，跳过绘图测试")
-        from simple_chess_ai.plot import plot_score
+        from .plot import plot_score
         self._write_csv('evaluation_metrics.csv', [
             {'game_idx': 10, 'elo': 1510.0, 'score': 0.6},
             {'game_idx': 20, 'elo': 1525.0, 'score': 0.65},

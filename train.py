@@ -7,7 +7,7 @@
 3. 循环：重复以上步骤持续提升
 
 用法：
-    python -m simple_chess_ai train --num_games 50 --num_simulations 100
+    python -m AIchess train --num_games 50 --num_simulations 100
 """
 
 import os
@@ -22,13 +22,13 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-from simple_chess_ai.game import (
+from .game import (
     ChessGame, NUM_ACTIONS, ACTION_LABELS, LABEL_TO_INDEX,
     flip_move, flip_policy, fen_to_planes
 )
-from simple_chess_ai.model import ChessModel
-from simple_chess_ai.mcts import MCTS
-from simple_chess_ai.export import (
+from .model import ChessModel
+from .mcts import MCTS
+from .export import (
     init_run_dir, append_self_play_jsonl, append_training_csv,
     append_evaluation_csv, load_evaluation_state, save_evaluation_state,
 )

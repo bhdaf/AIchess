@@ -3,19 +3,19 @@
 
 用法:
     训练模型:
-        python -m simple_chess_ai train [--num_games 50] [--num_simulations 100]
+        python -m AIchess train [--num_games 50] [--num_simulations 100]
 
     图形界面对弈:
-        python -m simple_chess_ai play [--model_path path/to/model.pth]
+        python -m AIchess play [--model_path path/to/model.pth]
 
     命令行对弈:
-        python -m simple_chess_ai play_cli [--model_path path/to/model.pth]
+        python -m AIchess play_cli [--model_path path/to/model.pth]
 
     模型评测:
-        python -m simple_chess_ai eval --model_a A.pth --model_b B.pth [--n_games 200]
+        python -m AIchess eval --model_a A.pth --model_b B.pth [--n_games 200]
 
     绘制训练曲线:
-        python -m simple_chess_ai plot --run_dir runs/run_YYYYMMDD_HHMMSS
+        python -m AIchess plot --run_dir runs/run_YYYYMMDD_HHMMSS
 """
 
 import sys
@@ -25,7 +25,7 @@ import argparse
 def main():
     parser = argparse.ArgumentParser(
         description='简化中国象棋AI',
-        usage='python -m simple_chess_ai {train,play,play_cli,eval,plot} [options]'
+        usage='python -m AIchess {train,play,play_cli,eval,plot} [options]'
     )
     parser.add_argument('command', choices=['train', 'play', 'play_cli', 'eval', 'plot'],
                         help='命令: train(训练), play(图形界面), play_cli(命令行), '
@@ -34,23 +34,23 @@ def main():
     args, remaining = parser.parse_known_args()
 
     if args.command == 'train':
-        from simple_chess_ai.train import main as train_main
+        from .train import main as train_main
         sys.argv = [sys.argv[0]] + remaining
         train_main()
     elif args.command == 'play':
-        from simple_chess_ai.gui import main as gui_main
+        from .gui import main as gui_main
         sys.argv = [sys.argv[0]] + remaining
         gui_main()
     elif args.command == 'play_cli':
-        from simple_chess_ai.cli import main as cli_main
+        from .cli import main as cli_main
         sys.argv = [sys.argv[0]] + remaining
         cli_main()
     elif args.command == 'eval':
-        from simple_chess_ai.eval import main as eval_main
+        from .eval import main as eval_main
         sys.argv = [sys.argv[0]] + remaining
         eval_main()
     elif args.command == 'plot':
-        from simple_chess_ai.plot import main as plot_main
+        from .plot import main as plot_main
         sys.argv = [sys.argv[0]] + remaining
         plot_main()
 
