@@ -16,7 +16,7 @@
 import math
 import numpy as np
 
-from simple_chess_ai.game import (
+from .game import (
     ChessGame, ACTION_LABELS, LABEL_TO_INDEX, NUM_ACTIONS,
     flip_move, flip_policy
 )

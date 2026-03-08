@@ -7,7 +7,7 @@
 
 用法::
 
-    python -m simple_chess_ai plot \\
+    python -m AIchess plot \\
         --run_dir runs/run_YYYYMMDD_HHMMSS \\
         [--out_dir output/] \\
         [--format png]

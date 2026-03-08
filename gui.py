@@ -8,7 +8,7 @@
 - AI使用MCTS搜索走法
 
 用法:
-    python -m simple_chess_ai play [--model_path path/to/model.pth]
+    python -m AIchess play [--model_path path/to/model.pth]
 """
 
 import os
@@ -19,11 +19,11 @@ import argparse
 
 import numpy as np
 
-from simple_chess_ai.game import (
+from .game import (
     ChessGame, BOARD_HEIGHT, BOARD_WIDTH, flip_move
 )
-from simple_chess_ai.model import ChessModel
-from simple_chess_ai.mcts import MCTS
+from .model import ChessModel
+from .mcts import MCTS
 
 # 默认模型路径
 DEFAULT_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'saved_model', 'model.pth')

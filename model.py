@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from simple_chess_ai.game import NUM_ACTIONS, BOARD_HEIGHT, BOARD_WIDTH
+from .game import NUM_ACTIONS, BOARD_HEIGHT, BOARD_WIDTH
 
 # 非法走法在策略 logits 中被置为此值，使 softmax 后概率接近 0
 _ILLEGAL_LOGIT = -1e9
@@ -150,7 +150,7 @@ class ChessModel:
             raise RuntimeError(
                 f"模型权重加载失败（{e}）。\n"
                 "提示：若使用的是旧版 GNN 模型文件，请删除后重新训练：\n"
-                "  python -m simple_chess_ai train"
+                "  python -m AIchess train"
             ) from e
         self.model.eval()
         return True

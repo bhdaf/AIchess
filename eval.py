@@ -5,7 +5,7 @@
 
 用法::
 
-    python -m simple_chess_ai eval \\
+    python -m AIchess eval \\
         --model_a path/to/model_a.pth \\
         --model_b path/to/model_b.pth \\
         [--n_games 200] [--num_simulations 50] [--max_moves 200] \\
@@ -22,9 +22,9 @@ import sys
 import numpy as np
 import torch
 
-from simple_chess_ai.model import ChessModel
-from simple_chess_ai.train import evaluate_models
-from simple_chess_ai.export import append_evaluation_csv
+from .model import ChessModel
+from .train import evaluate_models
+from .export import append_evaluation_csv
 
 
 def set_seeds(seed):
