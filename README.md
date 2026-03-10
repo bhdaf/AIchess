@@ -16,11 +16,12 @@
 ```
 AIchess/
 ├── __init__.py        # 包初始化
-├── __main__.py        # 主入口（train / play / play_cli / eval / plot）
+├── __main__.py        # 主入口（train / play / play_cli / eval / plot / vs_pikafish）
 ├── game.py            # 完整中国象棋规则与状态管理
 ├── model.py           # CNN 策略价值网络（PolicyValueNet + ChessModel）
 ├── mcts.py            # 蒙特卡洛树搜索（MCTS）
 ├── train.py           # 自对弈 + AlphaZero 风格训练管线（含 ELO 评测）
+├── vs_pikafish.py     # Pikafish 引擎集成：UCI 包装器 + 对战 + 训练
 ├── eval.py            # 独立模型评测模块
 ├── plot.py            # 训练曲线绘图模块（需要 matplotlib）
 ├── export.py          # 日志记录（JSONL / CSV / ELO 状态）
@@ -126,6 +127,125 @@ python -m AIchess plot \
 | `loss.png` | 训练损失随训练进度的变化曲线 |
 
 > **注意**：绘图需要安装 `matplotlib`。未安装时会打印清晰的安装提示。
+
+### 6. 对战 Pikafish 引擎
+
+[Pikafish](https://github.com/official-pikafish/Pikafish) 是基于 Stockfish 的强力中国象棋 UCI 引擎。
+通过 `vs_pikafish` 命令可以让 AIchess 与 Pikafish 对战，并可选地用对战数据训练模型。
+
+**前置准备**：从 [Pikafish Releases](https://github.com/official-pikafish/Pikafish/releases) 下载对应平台的可执行文件，并确保 `.nnue` 权重文件与可执行文件在同一目录。
+
+```bash
+# 仅对战一局（不训练）
+python -m AIchess vs_pikafish --engine ./pikafish
+
+# 对战 20 局并训练（AI 执红方）
+python -m AIchess vs_pikafish \
+    --engine ./pikafish \
+    --model_path saved_model/model.pth \
+    --num_games 20 \
+    --movetime 500 \
+    --num_simulations 100 \
+    --train
+
+# AI 执黑方
+python -m AIchess vs_pikafish --engine ./pikafish --ai_color black
+```
+
+#### vs_pikafish 参数说明
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--engine` | 必填 | Pikafish 可执行文件路径 |
+| `--model_path` | saved_model/model.pth | AIchess 模型文件路径 |
+| `--ai_color` | red | 学习方颜色（red / black） |
+| `--num_games` | 1 | 对战局数 |
+| `--num_simulations` | 100 | AI 每步 MCTS 模拟次数 |
+| `--movetime` | 1000 | Pikafish 每步思考时间（毫秒） |
+| `--max_moves` | 200 | 每局最大步数（超过判和） |
+| `--train` | 否 | 启用后对战结束用收集数据训练模型 |
+| `--batch_size` | 256 | 训练批大小（仅 `--train` 时有效） |
+| `--num_epochs` | 5 | 训练 epoch 数（仅 `--train` 时有效） |
+| `--lr` | 0.001 | 学习率（仅 `--train` 时有效） |
+| `--threads` | 1 | Pikafish 搜索线程数 |
+| `--hash_mb` | 64 | Pikafish 置换表大小（MB） |
+
+## Pikafish 集成设计说明
+
+### 协议：标准 UCI
+
+Pikafish 使用标准 **UCI（Universal Chess Interface）** 协议，与 Stockfish 命令集完全兼容。
+通信通过子进程标准输入/输出进行，主要命令序列：
+
+```
+→ uci
+← id name Pikafish ...
+← uciok
+→ isready
+← readyok
+→ ucinewgame
+→ isready
+← readyok
+→ position fen <FEN>
+→ go movetime <ms>
+← info depth ...
+← bestmove <move>
+→ quit
+```
+
+更多命令详见 [Pikafish UCI 文档](https://github.com/official-pikafish/Pikafish/wiki/UCI-&-Commands)。
+
+### 走法格式转换
+
+| 格式 | 示例 | 说明 |
+|------|------|------|
+| AIchess 内部格式 | `1242` | `x0y0x1y1`，列用数字 0–8，行用数字 0–9 |
+| Pikafish UCI 格式 | `b2e2` | `<file><rank><file><rank>`，列用字母 a–i，行用数字 0–9 |
+
+转换规则（`vs_pikafish.py` 中的 `aicoord_to_uci` / `uci_to_aicoord`）：
+- AIchess 列 `x` → Pikafish file `chr(ord('a') + x)`
+- 行号（rank）两种格式相同，无需转换
+
+### FEN 格式
+
+AIchess 的 `get_fen()` 返回棋盘部分，Pikafish 需要完整 FEN：
+
+```
+rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1
+```
+
+完整 FEN = `<棋盘FEN> <走子方> - - 0 1`，其中走子方为 `w`（红方）或 `b`（黑方）。
+
+### 时间控制：movetime（推荐）
+
+默认使用 `go movetime <ms>` 而非 `go depth <n>`，原因：
+
+- **可预测性**：movetime 直接限制挂钟时间，总对局时长稳定，适合批量训练
+- **硬件无关性**：depth 搜索实际耗时随局面复杂度和硬件差异很大
+- **训练建议**：从 `--movetime 100`（0.1 秒）起步，逐步增大以提升对手强度
+- 有 GPU 时建议配合增大 `--num_simulations`（AI 方 MCTS）来提升 AI 决策质量
+
+### 训练数据收集策略
+
+训练数据**只记录学习方（AIchess）的回合**，Pikafish 的走法不进入训练集。
+
+**数据格式**（与自对弈完全一致）：
+- `state`：14 通道特征平面，当前走子方视角，形状 `(14, 10, 9)`
+- `policy_target`：MCTS 访问计数归一化分布，形状 `(NUM_ACTIONS,)`
+- `value_target`：终局胜负回填，AI 方胜 = +1，负 = -1，和 = 0
+
+**为什么只记录 AI 方回合**：
+- 学习目标是提升 AIchess 自身的策略与价值估计，只有己方回合的数据对此有直接贡献
+- 记录 Pikafish 的走法会把远超 AIchess 当前水平的分布混入 policy target，造成梯度信号嘈杂
+- 这与 AlphaZero 自对弈格式保持一致，可与 `train` 命令产生的数据无缝合并
+
+### 课程学习建议（进阶）
+
+直接对战全力 Pikafish 可能导致长期失败、价值估计始终为 -1。建议逐步提升对手强度：
+
+1. 初期：`--movetime 50`（约 ELO 2000–2500），确保 AI 能偶尔赢棋
+2. 中期：`--movetime 500`，混合 50% 自对弈（`train` 命令）
+3. 后期：`--movetime 2000+`，主要依赖 vs_pikafish 数据
 
 ## 训练参数说明
 
