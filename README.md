@@ -226,3 +226,191 @@ R_cur_new = R_cur + K × (S - expected)
 cd ..  # 进入 AIchess 包的父目录
 python -m unittest AIchess.tests -v
 ```
+
+---
+
+## Pikafish 对战 + 训练扩展
+
+本节说明如何将 AIchess 与外部 UCI 引擎（如 [Pikafish](https://github.com/official-pikafish/Pikafish)）
+对接，并基于对战结果持续进化模型。
+
+### 新增文件概览
+
+| 文件 | 作用 |
+|------|------|
+| `uci.py` | 通用 UCI 引擎子进程封装（启动/握手/走子/退出） |
+| `pikafish_agent.py` | `BaseAgent` 接口 + `PikafishAgent` 实现（含格式转换） |
+| `vs_pikafish.py` | 对战脚本：AI 模型 vs UCI 引擎，输出 PGN + JSONL 日志 |
+
+### 快速开始：与 Pikafish 对弈
+
+```bash
+# 下载并编译 Pikafish（或从 release 下载预编译版本）
+# https://github.com/official-pikafish/Pikafish/releases
+
+# AI 执红，与 Pikafish（100 ms 每步）对弈 10 局
+python -m AIchess vs_pikafish \
+    --engine_path /path/to/pikafish \
+    --model_path saved_model/model.pth \
+    --n_games 10 \
+    --movetime 100 \
+    --ai_side both \
+    --num_simulations 50 \
+    --out runs/vs_pikafish_001
+
+# 调低引擎强度（通过 UCI 选项）
+python -m AIchess vs_pikafish \
+    --engine_path /path/to/pikafish \
+    --model_path saved_model/model.pth \
+    --n_games 20 \
+    --movetime 50 \
+    --engine_options "UCI_LimitStrength=true" "UCI_Elo=1500" \
+    --out runs/vs_pikafish_elo1500
+```
+
+输出文件：
+
+| 文件 | 说明 |
+|------|------|
+| `<out>/vs_pikafish.pgn` | 所有对局 PGN（可用 Arena/CuteChess 等工具打开） |
+| `<out>/vs_pikafish_log.jsonl` | 每局 JSONL 记录（含步数、走法、胜负原因） |
+
+### 坐标格式转换（已实现）
+
+| 场景 | 内部格式 | UCI ICCS 格式 |
+|------|----------|---------------|
+| 帅从 e0 走到 e1 | `"4041"` | `"e0e1"` |
+| 红车从 a0 走到 a2 | `"0002"` | `"a0a2"` |
+| 黑炮从 b7 走到 e7 | `"1747"` | `"b7e7"` |
+| 红马从 h0 走到 g2 | `"7062"` | `"h0g2"` |
+
+映射规则（`pikafish_agent.py`）：
+- 列 x (0–8) → UCI 文件 a–i（`chr(ord('a') + x)`）
+- 行 y (0–9) → UCI 阶 0–9（直接对应，红方底线=0，黑方底线=9）
+
+FEN 转换：`game.get_fen()` 返回棋盘部分；`game_to_uci_fen(game)` 追加走子方
+(`w`/`b`) 及其他 UCCI 字段，生成完整 UCI FEN。
+
+> **⚠ 一致性风险**：若 Pikafish 的规则实现（长将/长捉/三次重复等）与本仓库
+> `game.py` 存在差异，引擎走法可能在本地验证时被判为非法。`PikafishAgent.get_move()`
+> 会记录警告并返回 `None`；调用方应提供备用走法（如随机合法走法）。
+> 验证方法：运行 100 局快速对局，检查 `vs_pikafish_log.jsonl` 中
+> `terminate_reason` 是否出现异常终止。
+
+### 统一 Agent 接口
+
+`BaseAgent`（`pikafish_agent.py`）定义了所有棋手的公共接口：
+
+```python
+class BaseAgent(ABC):
+    def get_move(self, game: ChessGame) -> str | None: ...
+    def new_game(self) -> None: ...          # 可选
+    def update_move(self, move: str) -> None: ...  # 可选
+```
+
+借助此接口，可以在同一个 `play_game(red_agent, black_agent)` 循环中
+混合 `MCTS`、`PikafishAgent`、`RandomAgent` 等不同类型的棋手，
+无需修改训练主流程。
+
+### 对手池 + 课程学习方案（训练扩展设计）
+
+#### 对手池结构
+
+```text
+OpponentPool
+├── self_play       权重 α（当前模型自对弈）
+├── pikafish_weak   权重 β（限制强度的 Pikafish，如 Elo≈1500）
+├── pikafish_mid    权重 γ（中等强度，如 Elo≈2000）
+├── pikafish_full   权重 δ（全强度，movetime=100ms）
+└── historical      权重 ε（随机选历史检查点，防止策略坍塌）
+```
+
+#### 课程学习阶段
+
+| 阶段 | 训练局数 | self_play | pikafish_weak | pikafish_mid | pikafish_full |
+|------|----------|-----------|---------------|--------------|---------------|
+| 初期 | 0–500    | 80% | 20% | 0%  | 0%  |
+| 中期 | 500–2000 | 50% | 20% | 30% | 0%  |
+| 后期 | 2000+    | 20% | 10% | 30% | 40% |
+
+#### 数据收集策略
+
+仅收集 **我方回合** 的训练样本，引擎回合不产生训练数据：
+
+```python
+# 对局循环（伪代码）
+for step in game:
+    if is_my_turn:
+        actions, probs = mcts.get_action_probs(game, add_noise=True)
+        move = sample(actions, probs)
+        buffer.append((game.to_planes(), probs, None))  # value 待回填
+    else:
+        move = engine_agent.get_move(game)
+    game.step(move)
+
+# 回填 value（终局胜负）
+outcome = +1 if winner == my_side else -1 if winner != "draw" else 0
+for sample in buffer:
+    sample.value = outcome
+    outcome = -outcome  # 翻转视角
+```
+
+#### 训练循环伪代码
+
+```python
+# generate_games → buffer → train_step → checkpoint → eval_gate
+for iteration in range(max_iterations):
+    # 1. 生成对局数据（可多进程并行）
+    opponent = opponent_pool.sample(curriculum_stage(iteration))
+    games_data = parallel_generate_games(current_model, opponent, n=N)
+    replay_buffer.extend(games_data)
+
+    # 2. 训练
+    for epoch in range(num_epochs):
+        batch = replay_buffer.sample(batch_size)
+        loss = policy_loss(batch) + value_loss(batch)
+        optimizer.step(loss)
+
+    # 3. 检查点
+    if iteration % save_interval == 0:
+        save_checkpoint(current_model, iteration)
+        opponent_pool.add_historical(current_model.copy())
+
+    # 4. 评测门控（与上一检查点对战，胜率 > 55% 才更新基准）
+    if iteration % eval_interval == 0:
+        score = evaluate(current_model, baseline_model)
+        if score > 0.55:
+            baseline_model = current_model.copy()
+            print(f"[迭代 {iteration}] 模型升级，得分 {score:.2%}")
+```
+
+#### 性能优化建议
+
+| 优化点 | 建议 |
+|--------|------|
+| 并行自对弈 | 使用 `multiprocessing.Pool` 并行生成对局数据 |
+| 引擎思考时间 | 训练期从 `movetime=10ms` 起步，强化期再逐步增加 |
+| MCTS 模拟次数 | 训练期用 50–100，推理期用 200–400 |
+| 位置缓存 | 开启 `MCTS(cache_size=2000)` 减少重复评估 |
+| 引擎进程复用 | `PikafishAgent` 保持进程常驻，避免每局重启 |
+
+### 风险清单与缓解策略
+
+| 风险 | 严重性 | 验证方法 | 缓解策略 |
+|------|--------|----------|----------|
+| 规则不一致（长将/长捉/重复等） | 高 | 跑 100 局快速对局，检查异常终止率 | 在 `PikafishAgent.get_move()` 中添加合法性验证；规则差异较大时考虑关闭引擎的特殊规则 |
+| FEN 格式不兼容 | 中 | 比对 `game_to_uci_fen()` 输出与引擎期望格式 | 查阅 Pikafish 文档；必要时调整 FEN 字段顺序 |
+| 一直输导致梯度贫瘠 | 高 | 监控 value loss 是否趋近于常数 | 严格执行课程学习；初期以弱引擎为主要对手 |
+| 速度瓶颈 | 中 | 测量每局耗时 | 降低 movetime + num_simulations；多进程并行 |
+| 策略坍塌（遗忘） | 中 | 定期与历史模型对战 | 历史模型池 + 混合 self-play 比例 |
+| 数据分布偏移 | 低 | 监控训练数据来源比例 | 限制 replay_buffer 中引擎对局数据的比例上限 |
+
+### 验证步骤（里程碑）
+
+```
+M1：走法一致性 ─ 与 Pikafish 完整下完 100 局，无异常终止
+M2：对战脚本   ─ `vs_pikafish` 命令生成可读 PGN，步数分布合理
+M3：课程学习   ─ AI 对弱引擎（Elo≈1500）胜率从随机水平提升到 >30%
+M4：强度提升   ─ AI 的 ELO 较训练前提升 200+ 点
+M5：全强度对战 ─ 对全强度 Pikafish 胜率稳定在 >5%（非随机）
+```
