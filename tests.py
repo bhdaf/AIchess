@@ -1200,4 +1200,112 @@ class TestPlotModule(unittest.TestCase):
         self.assertTrue(out_path.endswith('score.png'))
 
 
+class TestPikafishConversion(unittest.TestCase):
+    """测试 Pikafish UCI 走法和 FEN 格式转换"""
+
+    def setUp(self):
+        from .pikafish import internal_move_to_uci, uci_move_to_internal, board_fen_to_uci_fen
+        self.internal_to_uci = internal_move_to_uci
+        self.uci_to_internal = uci_move_to_internal
+        self.board_fen_to_uci_fen = board_fen_to_uci_fen
+
+    # ------------------------------------------------------------------
+    # 走法格式转换
+    # ------------------------------------------------------------------
+
+    def test_internal_to_uci_cannon(self):
+        """红炮平中: (1,2)->(4,2) = '1242' -> 'b2e2'"""
+        self.assertEqual(self.internal_to_uci('1242'), 'b2e2')
+
+    def test_internal_to_uci_king(self):
+        """帅前进: (4,0)->(4,1) = '4041' -> 'e0e1'"""
+        self.assertEqual(self.internal_to_uci('4041'), 'e0e1')
+
+    def test_internal_to_uci_pawn(self):
+        """红兵前进: (0,3)->(0,4) = '0304' -> 'a3a4'"""
+        self.assertEqual(self.internal_to_uci('0304'), 'a3a4')
+
+    def test_internal_to_uci_all_files(self):
+        """所有文件字母 a-i 对应列 0-8"""
+        for col, letter in enumerate('abcdefghi'):
+            move = f"{col}0{col}1"
+            uci = self.internal_to_uci(move)
+            self.assertEqual(uci[0], letter)
+            self.assertEqual(uci[2], letter)
+
+    def test_uci_to_internal_cannon(self):
+        """'b2e2' -> '1242'"""
+        self.assertEqual(self.uci_to_internal('b2e2'), '1242')
+
+    def test_uci_to_internal_king(self):
+        """'e0e1' -> '4041'"""
+        self.assertEqual(self.uci_to_internal('e0e1'), '4041')
+
+    def test_roundtrip_internal_to_uci(self):
+        """内部格式 -> UCI -> 内部格式 应还原"""
+        for move in ['1242', '4041', '0304', '8089', '0900']:
+            uci = self.internal_to_uci(move)
+            restored = self.uci_to_internal(uci)
+            self.assertEqual(restored, move, f"往返转换失败: {move} -> {uci} -> {restored}")
+
+    def test_roundtrip_uci_to_internal(self):
+        """UCI 格式 -> 内部 -> UCI 应还原"""
+        for uci in ['b2e2', 'h9g7', 'a0a1', 'i9i8', 'e0e1']:
+            internal = self.uci_to_internal(uci)
+            restored = self.internal_to_uci(internal)
+            self.assertEqual(restored, uci, f"往返转换失败: {uci} -> {internal} -> {restored}")
+
+    # ------------------------------------------------------------------
+    # FEN 格式转换
+    # ------------------------------------------------------------------
+
+    def test_board_fen_to_uci_fen_red(self):
+        """红方先行 FEN 应以 'w' 结尾部分"""
+        board_fen = 'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR'
+        uci_fen = self.board_fen_to_uci_fen(board_fen, red_to_move=True)
+        self.assertEqual(uci_fen, f'{board_fen} w - - 0 1')
+
+    def test_board_fen_to_uci_fen_black(self):
+        """黑方先行 FEN 应以 'b' 结尾部分"""
+        board_fen = 'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR'
+        uci_fen = self.board_fen_to_uci_fen(board_fen, red_to_move=False)
+        self.assertEqual(uci_fen, f'{board_fen} b - - 0 1')
+
+    def test_board_fen_to_uci_fen_custom_clocks(self):
+        """自定义半步数和全步数"""
+        board_fen = 'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR'
+        uci_fen = self.board_fen_to_uci_fen(board_fen, red_to_move=True,
+                                             halfmove_clock=5, fullmove_number=3)
+        self.assertEqual(uci_fen, f'{board_fen} w - - 5 3')
+
+    def test_board_fen_preserves_board_part(self):
+        """转换后棋盘部分不变"""
+        board_fen = 'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR'
+        uci_fen = self.board_fen_to_uci_fen(board_fen)
+        self.assertTrue(uci_fen.startswith(board_fen))
+
+    def test_uci_fen_format_fields(self):
+        """UCI FEN 应有 6 个字段"""
+        board_fen = 'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR'
+        uci_fen = self.board_fen_to_uci_fen(board_fen)
+        fields = uci_fen.split()
+        self.assertEqual(len(fields), 6)
+        # 第2字段为走子方
+        self.assertIn(fields[1], ('w', 'b'))
+        # 第3、4字段为 '-'
+        self.assertEqual(fields[2], '-')
+        self.assertEqual(fields[3], '-')
+
+    def test_initial_game_uci_fen(self):
+        """初始棋盘 FEN 转换正确"""
+        from .game import ChessGame
+        game = ChessGame()
+        game.reset()
+        board_fen = game.get_fen()
+        uci_fen = self.board_fen_to_uci_fen(board_fen, game.red_to_move)
+        expected = (
+            'rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1'
+        )
+        self.assertEqual(uci_fen, expected)
+
 
