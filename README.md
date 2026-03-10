@@ -16,11 +16,13 @@
 ```
 AIchess/
 ├── __init__.py        # 包初始化
-├── __main__.py        # 主入口（train / play / play_cli / eval / plot）
+├── __main__.py        # 主入口（train / play / play_cli / eval / plot / vs_pikafish）
 ├── game.py            # 完整中国象棋规则与状态管理
 ├── model.py           # CNN 策略价值网络（PolicyValueNet + ChessModel）
 ├── mcts.py            # 蒙特卡洛树搜索（MCTS）
 ├── train.py           # 自对弈 + AlphaZero 风格训练管线（含 ELO 评测）
+├── pikafish.py        # Pikafish UCI 封装 + 走法/FEN 转换 ← 新增
+├── vs_pikafish.py     # AI vs Pikafish 对战命令 ← 新增
 ├── eval.py            # 独立模型评测模块
 ├── plot.py            # 训练曲线绘图模块（需要 matplotlib）
 ├── export.py          # 日志记录（JSONL / CSV / ELO 状态）
@@ -126,6 +128,95 @@ python -m AIchess plot \
 | `loss.png` | 训练损失随训练进度的变化曲线 |
 
 > **注意**：绘图需要安装 `matplotlib`。未安装时会打印清晰的安装提示。
+
+### 6. 与 Pikafish 引擎对战
+
+> **协议确认**（来自 [official-pikafish/Pikafish](https://github.com/official-pikafish/Pikafish) 及其 [UCI & Commands 文档](https://github.com/official-pikafish/Pikafish/wiki/UCI-&-Commands)）：  
+> Pikafish 使用标准 **UCI**（Universal Chess Interface）协议，**不是** UCCI。
+
+#### 6.1 下载 Pikafish 引擎
+
+1. 前往 [Pikafish Releases](https://github.com/official-pikafish/Pikafish/releases) 下载对应平台二进制文件（或从源码编译）
+2. 确保 `pikafish.nnue` 权重文件与可执行文件在同一目录
+3. Linux/macOS 赋予执行权限：`chmod +x pikafish`
+
+#### 6.2 运行对战
+
+```bash
+# 基本对战（AI 执红方，引擎每步 100ms，1 局，打印棋盘）
+python -m AIchess vs_pikafish \
+    --engine_path ./pikafish \
+    --verbose
+
+# 指定模型和执子颜色
+python -m AIchess vs_pikafish \
+    --engine_path ./pikafish \
+    --model_path runs/run_20260310_120000/model_best.pth \
+    --ai_color black \
+    --movetime_ms 200
+
+# 多局对战统计（快速评测）
+python -m AIchess vs_pikafish \
+    --engine_path ./pikafish \
+    --n_games 20 \
+    --movetime_ms 50 \
+    --num_simulations 50
+
+# 使用固定搜索深度
+python -m AIchess vs_pikafish \
+    --engine_path ./pikafish \
+    --depth 8
+```
+
+**`vs_pikafish` 参数说明：**
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `--engine_path` | 必填 | Pikafish 可执行文件路径 |
+| `--model_path` | 自动检测 | AIchess 模型 .pth 文件路径 |
+| `--ai_color` | `red` | AI 执子颜色（`red`=先手，`black`=后手） |
+| `--movetime_ms` | `100` | 引擎每步思考时间（毫秒） |
+| `--depth` | 无 | 引擎搜索深度（指定后忽略 movetime） |
+| `--num_simulations` | `200` | AI MCTS 模拟次数 |
+| `--n_games` | `1` | 对战局数 |
+| `--max_moves` | `300` | 每局最大步数 |
+| `--verbose` | 关闭 | 打印棋盘和每步走法 |
+
+#### 6.3 协议与格式说明
+
+**UCI 握手流程：**
+
+```
+> uci                       ← 发送
+  id name Pikafish ...      ← 引擎响应
+  ...
+  uciok                     ← 就绪
+> setoption name Threads value 1
+> isready
+  readyok
+> ucinewgame
+> isready
+  readyok
+> position fen <完整FEN>
+> go movetime 100
+  ...
+  bestmove b2e2             ← 引擎最优走法
+```
+
+**走法坐标格式（Pikafish ↔ 内部）：**
+
+Pikafish UCI 格式：`<文件字母><行号><文件字母><行号>`（文件 a~i = 列 0~8，行 0~9）
+
+| 内部格式 | Pikafish UCI | 含义 |
+|---------|-------------|------|
+| `1242` | `b2e2` | 红炮从 (列1,行2) 移至 (列4,行2) |
+| `4041` | `e0e1` | 帅从 (列4,行0) 前进一步 |
+| `0304` | `a3a4` | 红兵从 (列0,行3) 前进一步 |
+
+**FEN 格式（内部 → Pikafish）：**
+
+内部 `get_fen()` 返回棋盘部分（如 `rnbakabnr/9/1c5c1/.../RNBAKABNR`），  
+Pikafish 需要完整 UCI FEN：在棋盘部分后追加 ` w - - 0 1`（红方走）或 ` b - - 0 1`（黑方走）。
 
 ## 训练参数说明
 
