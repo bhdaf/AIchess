@@ -1201,3 +1201,110 @@ class TestPlotModule(unittest.TestCase):
 
 
 
+
+
+class TestUCIConversion(unittest.TestCase):
+    """测试 UCI ICCS 走法格式与内部格式的互转（pikafish_agent 模块）"""
+
+    def setUp(self):
+        from .pikafish_agent import internal_to_uci, uci_to_internal, game_to_uci_fen
+        self.internal_to_uci = internal_to_uci
+        self.uci_to_internal = uci_to_internal
+        self.game_to_uci_fen = game_to_uci_fen
+
+    # ------------------------------------------------------------------
+    # internal_to_uci
+    # ------------------------------------------------------------------
+
+    def test_internal_to_uci_corner(self):
+        """(0,0) -> a0"""
+        self.assertEqual(self.internal_to_uci("0000"), "a0a0")
+
+    def test_internal_to_uci_rook(self):
+        """红车从 a0 到 a2：内部 "0002" -> UCI "a0a2" """
+        self.assertEqual(self.internal_to_uci("0002"), "a0a2")
+
+    def test_internal_to_uci_cannon(self):
+        """炮从 b7 到 e7：内部 "1771" / 列1行7->列4行7 -> "b7e7" """
+        # 炮的初始位置：黑方炮在 (1,7) 和 (7,7)
+        self.assertEqual(self.internal_to_uci("1747"), "b7e7")
+
+    def test_internal_to_uci_king_e(self):
+        """帅在 e0 (4,0)：内部 "4041" -> UCI "e0e1" """
+        self.assertEqual(self.internal_to_uci("4041"), "e0e1")
+
+    def test_internal_to_uci_i_column(self):
+        """最右列 x=8（i 列）：内部 "8082" -> UCI "i0i2" """
+        self.assertEqual(self.internal_to_uci("8082"), "i0i2")
+
+    def test_internal_to_uci_invalid_length(self):
+        """长度不为 4 应抛出 ValueError"""
+        with self.assertRaises(ValueError):
+            self.internal_to_uci("123")
+
+    def test_internal_to_uci_non_digit(self):
+        """非数字字符应抛出 ValueError"""
+        with self.assertRaises(ValueError):
+            self.internal_to_uci("a0b1")
+
+    # ------------------------------------------------------------------
+    # uci_to_internal
+    # ------------------------------------------------------------------
+
+    def test_uci_to_internal_roundtrip(self):
+        """internal_to_uci -> uci_to_internal 应还原原始走法"""
+        for move in ["0000", "0009", "8082", "4041", "1747", "7072"]:
+            self.assertEqual(
+                self.uci_to_internal(self.internal_to_uci(move)),
+                move,
+                msg=f"round-trip failed for {move!r}",
+            )
+
+    def test_uci_to_internal_h0h2(self):
+        """UCI h0h2 -> 内部 "7072" """
+        self.assertEqual(self.uci_to_internal("h0h2"), "7072")
+
+    def test_uci_to_internal_e0e1(self):
+        """UCI e0e1 -> 内部 "4041" """
+        self.assertEqual(self.uci_to_internal("e0e1"), "4041")
+
+    def test_uci_to_internal_invalid_length(self):
+        """长度不为 4 应抛出 ValueError"""
+        with self.assertRaises(ValueError):
+            self.uci_to_internal("h00")
+
+    def test_uci_to_internal_out_of_range_file(self):
+        """列超出 a-i 范围（如 'j'）应抛出 ValueError"""
+        with self.assertRaises(ValueError):
+            self.uci_to_internal("j0j1")
+
+    # ------------------------------------------------------------------
+    # game_to_uci_fen
+    # ------------------------------------------------------------------
+
+    def test_game_to_uci_fen_initial_red(self):
+        """初始局面红方先手 FEN 应以 board_fen + ' w' 开头"""
+        game = ChessGame()
+        game.reset()
+        fen = self.game_to_uci_fen(game)
+        board, side = fen.split(" ")[:2]
+        self.assertEqual(board, INIT_FEN)
+        self.assertEqual(side, "w")
+
+    def test_game_to_uci_fen_after_move_black(self):
+        """走一步后轮到黑方，FEN 中 side 应为 'b'"""
+        game = ChessGame()
+        game.reset()
+        # 走一步合法走法
+        legal = game.get_legal_moves()
+        game.step(legal[0])
+        fen = self.game_to_uci_fen(game)
+        side = fen.split(" ")[1]
+        self.assertEqual(side, "b")
+
+    def test_game_to_uci_fen_fields_count(self):
+        """UCI FEN 应包含至少 6 个空格分隔字段"""
+        game = ChessGame()
+        game.reset()
+        fen = self.game_to_uci_fen(game)
+        self.assertGreaterEqual(len(fen.split()), 6)
