@@ -90,7 +90,10 @@ def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=
     return score, wins_a, wins_b, draws
 
 
-def self_play_game(model, num_simulations=100, max_moves=200, temperature_threshold=30):
+def self_play_game(model, num_simulations=100, max_moves=200,
+                   temperature_threshold=80, temperature_after=0.5,
+                   repetition_threshold=3, repeat_penalty=0.02,
+                   repeat_escape_temperature_boost=2.0):
     """
     执行一局自对弈
 
@@ -98,10 +101,18 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
         model: ChessModel实例
         num_simulations: MCTS模拟次数
         max_moves: 最大步数（超过判和）
-        temperature_threshold: 前N步使用温度1.0探索
+        temperature_threshold: 前N步使用温度1.0探索（默认80）
+        temperature_after: 超过threshold后的温度（默认0.5）
+        repetition_threshold: 局面重复次数阈值（默认3）
+        repeat_penalty: 触发重复风险时对当前走子方的惩罚值（默认0.02）
+        repeat_escape_temperature_boost: 检测到重复风险时的温度倍增系数（默认2.0）
 
     Returns:
         training_data: [(state_planes, policy_target, value_target), ...]
+        winner: 'red'/'black'/None（和棋）
+        move_count: 总步数
+        repeat_avoided_count: 反重复干预次数
+        total_penalty_sum: 累计惩罚总量
     """
     game = ChessGame()
     game.reset()
@@ -112,15 +123,62 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
     players = []
 
     move_count = 0
+    repeat_avoided_count = 0
+    penalty_sums = {1: 0.0, -1: 0.0}  # red(+1): penalty, black(-1): penalty
+    in_repeat_risk = False  # 上一步是否检测到重复风险
 
     while not game.done and move_count < max_moves:
-        temperature = 1.0 if move_count < temperature_threshold else 0.1
+        temperature = 1.0 if move_count < temperature_threshold else temperature_after
+        # 检测到重复风险时临时提升温度，鼓励探索
+        if in_repeat_risk and repeat_escape_temperature_boost > 1.0:
+            temperature = min(1.0, temperature * repeat_escape_temperature_boost)
 
         actions, probs = mcts.get_action_probs(game, temperature=temperature, add_noise=True)
 
         if not actions:
             break
 
+        # --- 反重复循环过滤 ---
+        # 将MCTS（红方视角）动作转换为实际棋盘坐标
+        actual_actions = [
+            (a if game.red_to_move else flip_move(a)) for a in actions
+        ]
+        # 检测哪些动作会触发重复局面
+        non_repeat_mask = [
+            not game.would_repeat(act, threshold=repetition_threshold)
+            for act in actual_actions
+        ]
+
+        current_player = 1 if game.red_to_move else -1
+
+        if not all(non_repeat_mask) and any(non_repeat_mask):
+            # 部分动作有重复风险——过滤并对当前走子方施加惩罚
+            filtered_actions = [a for a, ok in zip(actions, non_repeat_mask) if ok]
+            filtered_probs = np.array(
+                [p for p, ok in zip(probs, non_repeat_mask) if ok], dtype=np.float32
+            )
+            total = filtered_probs.sum()
+            if total > 0:
+                filtered_probs /= total
+            else:
+                filtered_probs = np.ones(len(filtered_actions), dtype=np.float32) / len(filtered_actions)
+            repeat_avoided_count += 1
+            penalty_sums[current_player] += repeat_penalty
+            in_repeat_risk = True
+            final_actions = filtered_actions
+            final_probs = filtered_probs
+        elif not any(non_repeat_mask):
+            # 所有动作均有重复风险（极端情况）——回退到全集，不施加额外惩罚
+            final_actions = actions
+            final_probs = np.array(probs, dtype=np.float32)
+            in_repeat_risk = True
+        else:
+            # 无重复风险
+            final_actions = actions
+            final_probs = np.array(probs, dtype=np.float32)
+            in_repeat_risk = False
+
+        # 记录状态和完整MCTS策略（过滤前）
         planes = game.to_planes()
         policy_target = np.zeros(NUM_ACTIONS, dtype=np.float32)
         for action, prob in zip(actions, probs):
@@ -129,10 +187,10 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
 
         states.append(planes)
         policies.append(policy_target)
-        players.append(1 if game.red_to_move else -1)
+        players.append(current_player)
 
-        action_idx = np.random.choice(len(actions), p=probs)
-        chosen_action = actions[action_idx]
+        action_idx = np.random.choice(len(final_actions), p=final_probs)
+        chosen_action = final_actions[action_idx]
 
         if not game.red_to_move:
             actual_action = flip_move(chosen_action)
@@ -150,12 +208,16 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
     else:
         winner = 0
 
+    # 构建训练数据，叠加惩罚 shaping 并 clamp 至 [-1,1]
     training_data = []
     for state, policy, player in zip(states, policies, players):
-        value = winner * player
+        base_value = winner * player
+        penalty = penalty_sums[player]
+        value = float(np.clip(base_value - penalty, -1.0, 1.0))
         training_data.append((state, policy, value))
 
-    return training_data, game.winner, move_count
+    total_penalty_sum = penalty_sums[1] + penalty_sums[-1]
+    return training_data, game.winner, move_count, repeat_avoided_count, total_penalty_sum
 
 
 def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
@@ -250,7 +312,10 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  buffer_size=10000, model_path=None, save_interval=10,
                  quick=False,
                  eval_interval=0, eval_games=40, eval_simulations=50,
-                 eval_opponent='previous', elo_k=32):
+                 eval_opponent='previous', elo_k=32,
+                 temperature_threshold=80, temperature_after=0.5,
+                 repetition_threshold=3, repeat_penalty=0.02,
+                 repeat_escape_temperature_boost=2.0):
     """
     运行完整的训练流程
 
@@ -270,6 +335,11 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         eval_simulations: 评测每步MCTS模拟次数
         eval_opponent: 评测对手类型（'previous' / 'self'）
         elo_k: ELO K 因子
+        temperature_threshold: 前N步使用高温度探索（默认80）
+        temperature_after: 超过threshold后的温度（默认0.5）
+        repetition_threshold: 局面重复次数阈值（默认3）
+        repeat_penalty: 触发重复风险时的惩罚值（默认0.02）
+        repeat_escape_temperature_boost: 检测到重复风险时的温度倍增（默认2.0）
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH

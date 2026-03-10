@@ -886,6 +886,36 @@ class ChessGame:
         info = {'reason': self.terminate_reason, 'winner': self.winner}
         return obs, reward, self.done, info
 
+    def would_repeat(self, action, threshold=3):
+        """
+        预判某动作是否会导致局面重复达到阈值（触发重复局面判定）。
+
+        Args:
+            action: 走法字符串（实际棋盘坐标 "x0y0x1y1"）
+            threshold: 局面重复次数阈值（默认 3）
+
+        Returns:
+            bool: True 表示执行该动作后局面将出现 threshold 次（触发重复判定）
+        """
+        x0, y0 = int(action[0]), int(action[1])
+        x1, y1 = int(action[2]), int(action[3])
+        piece_moving = self.board[y0][x0]
+        captured = self.board[y1][x1]
+
+        # 增量计算新局面哈希（不修改棋盘）
+        new_hash = self.pos_hash
+        if piece_moving is not None:
+            new_hash ^= self._zobrist_piece(piece_moving, x0, y0)
+        if captured is not None:
+            new_hash ^= self._zobrist_piece(captured, x1, y1)
+        if piece_moving is not None:
+            new_hash ^= self._zobrist_piece(piece_moving, x1, y1)
+        new_hash ^= _ZOBRIST_SIDE  # 切换走子方
+
+        # 若出现次数 >= threshold-1，执行后将达到 threshold 次
+        count = self.pos_history.count(new_hash)
+        return count >= threshold - 1
+
     def _check_king_face(self):
         """检查将帅是否面对面（飞将）"""
         red_king = None
