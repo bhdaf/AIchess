@@ -6,6 +6,7 @@
 
 import unittest
 import os
+import random
 import numpy as np
 
 from .game import (
@@ -1308,3 +1309,138 @@ class TestUCIConversion(unittest.TestCase):
         game.reset()
         fen = self.game_to_uci_fen(game)
         self.assertGreaterEqual(len(fen.split()), 6)
+
+
+class TestPlayVsOpponent(unittest.TestCase):
+    """测试与虚拟对手对弈的数据收集（play_game_vs_opponent_collect_my_turn）"""
+
+    def _make_random_agent(self):
+        """返回一个随机走法 Agent（实现 BaseAgent 接口）"""
+        from .pikafish_agent import BaseAgent
+
+        class RandomAgent(BaseAgent):
+            """随机选取合法走法的虚拟对手，用于测试"""
+
+            def get_move(self, game):
+                legal = game.get_legal_moves()
+                return random.choice(legal) if legal else None
+
+        return RandomAgent()
+
+    def test_returns_correct_format(self):
+        """验证返回值格式：training_data 列表、winner、moves 整数、metadata 字典"""
+        model = ChessModel(num_channels=64, num_res_blocks=2)
+        model.build()
+
+        from .train import play_game_vs_opponent_collect_my_turn
+        training_data, winner, moves, metadata = play_game_vs_opponent_collect_my_turn(
+            model=model,
+            opponent_agent=self._make_random_agent(),
+            my_side='red',
+            game_idx=0,
+            num_simulations=3,
+            max_moves=20,
+        )
+
+        self.assertIsInstance(training_data, list)
+        self.assertIsInstance(moves, int)
+        self.assertIsInstance(metadata, dict)
+        self.assertIn('my_side', metadata)
+        self.assertIn('num_my_samples', metadata)
+        self.assertEqual(metadata['my_side'], 'red')
+
+    def test_training_data_shapes(self):
+        """每个训练样本的 state、policy、value 形状和范围应正确"""
+        from .game import NUM_ACTIONS
+        model = ChessModel(num_channels=64, num_res_blocks=2)
+        model.build()
+
+        from .train import play_game_vs_opponent_collect_my_turn
+        training_data, _, _, _ = play_game_vs_opponent_collect_my_turn(
+            model=model,
+            opponent_agent=self._make_random_agent(),
+            my_side='red',
+            game_idx=0,
+            num_simulations=3,
+            max_moves=20,
+        )
+
+        if not training_data:
+            self.skipTest("未产生训练样本（对局过短），跳过形状检验")
+
+        for state, policy, value in training_data:
+            self.assertEqual(state.shape, (14, 10, 9),
+                             msg="state_planes 形状应为 (14, 10, 9)")
+            self.assertEqual(len(policy), NUM_ACTIONS,
+                             msg="policy_target 长度应等于 NUM_ACTIONS")
+            self.assertGreaterEqual(float(value), -1.0)
+            self.assertLessEqual(float(value), 1.0)
+
+    def test_only_my_turns_collected_red(self):
+        """执红时，样本数应不超过走棋总步数的一半（+1 容错）"""
+        model = ChessModel(num_channels=64, num_res_blocks=2)
+        model.build()
+
+        from .train import play_game_vs_opponent_collect_my_turn
+        training_data, _, moves, metadata = play_game_vs_opponent_collect_my_turn(
+            model=model,
+            opponent_agent=self._make_random_agent(),
+            my_side='red',
+            game_idx=0,
+            num_simulations=3,
+            max_moves=30,
+        )
+
+        # 我方（红）先手，样本数 <= ceil(moves / 2)
+        self.assertLessEqual(
+            len(training_data), moves // 2 + 2,
+            msg="我方样本数不应超过总步数的约一半"
+        )
+
+    def test_alternate_side(self):
+        """alternate 模式：game_idx=0 执红，game_idx=1 执黑"""
+        model = ChessModel(num_channels=64, num_res_blocks=2)
+        model.build()
+
+        from .train import play_game_vs_opponent_collect_my_turn
+
+        _, _, _, meta0 = play_game_vs_opponent_collect_my_turn(
+            model=model,
+            opponent_agent=self._make_random_agent(),
+            my_side='alternate',
+            game_idx=0,
+            num_simulations=2,
+            max_moves=10,
+        )
+        _, _, _, meta1 = play_game_vs_opponent_collect_my_turn(
+            model=model,
+            opponent_agent=self._make_random_agent(),
+            my_side='alternate',
+            game_idx=1,
+            num_simulations=2,
+            max_moves=10,
+        )
+        self.assertEqual(meta0['my_side'], 'red')
+        self.assertEqual(meta1['my_side'], 'black')
+
+    def test_train_model_with_collected_data(self):
+        """用收集到的训练数据调用 train_model，应返回非负浮点损失"""
+        model = ChessModel(num_channels=64, num_res_blocks=2)
+        model.build()
+
+        from .train import play_game_vs_opponent_collect_my_turn, train_model
+        training_data, _, _, _ = play_game_vs_opponent_collect_my_turn(
+            model=model,
+            opponent_agent=self._make_random_agent(),
+            my_side='red',
+            game_idx=0,
+            num_simulations=3,
+            max_moves=40,
+        )
+
+        if not training_data:
+            self.skipTest("未产生足够训练样本，跳过 train_model 测试")
+
+        loss = train_model(model, training_data, batch_size=4, epochs=1)
+        self.assertIsInstance(loss, float)
+        self.assertGreaterEqual(loss, 0.0)

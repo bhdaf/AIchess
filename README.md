@@ -11,22 +11,34 @@
 - **内置 ELO 评分系统**：训练过程中自动追踪模型强度变化
 - **图形界面（Pygame）与命令行对弈模式**
 
+## 特性亮点（新增）
+
+- **对手池 + 课程学习**：训练时可引入 Pikafish 等 UCI 引擎作为对手，按三阶段课程学习自动调配自对弈/弱/中/全强度引擎/历史版本对手
+- **引擎进程复用**：PikafishAgent 保持子进程常驻，避免每局重启开销
+- **我方样本收集**：引擎回合不产生训练样本，只收集我方 MCTS 回合的数据
+- **评测门控**：`--eval_gate` 参数，仅当评测得分 ≥ 阈值时才更新基准模型
+
 ## 目录结构
 
 ```
 AIchess/
-├── __init__.py        # 包初始化
-├── __main__.py        # 主入口（train / play / play_cli / eval / plot）
-├── game.py            # 完整中国象棋规则与状态管理
-├── model.py           # CNN 策略价值网络（PolicyValueNet + ChessModel）
-├── mcts.py            # 蒙特卡洛树搜索（MCTS）
-├── train.py           # 自对弈 + AlphaZero 风格训练管线（含 ELO 评测）
-├── eval.py            # 独立模型评测模块
-├── plot.py            # 训练曲线绘图模块（需要 matplotlib）
-├── export.py          # 日志记录（JSONL / CSV / ELO 状态）
-├── gui.py             # Pygame 图形界面
-├── cli.py             # 命令行文字界面
-├── tests.py           # 单元测试
+├── __init__.py          # 包初始化
+├── __main__.py          # 主入口（train / play / play_cli / eval / plot / vs_pikafish）
+├── game.py              # 完整中国象棋规则与状态管理
+├── model.py             # CNN 策略价值网络（PolicyValueNet + ChessModel）
+├── mcts.py              # 蒙特卡洛树搜索（MCTS）
+├── train.py             # 自对弈 + AlphaZero 风格训练管线（含 ELO 评测、对手池）
+├── agents.py            # MCTSAgent 封装（BaseAgent 兼容接口）
+├── opponent_pool.py     # OpponentPool 对手池（课程学习调度）
+├── pikafish_agent.py    # BaseAgent 接口 + PikafishAgent UCI 引擎封装
+├── uci.py               # UCIEngine 通用 UCI 协议封装
+├── vs_pikafish.py       # 与 Pikafish 对弈脚本（输出 PGN / JSONL）
+├── eval.py              # 独立模型评测模块
+├── plot.py              # 训练曲线绘图模块（需要 matplotlib）
+├── export.py            # 日志记录（JSONL / CSV / ELO 状态）
+├── gui.py               # Pygame 图形界面
+├── cli.py               # 命令行文字界面
+├── tests.py             # 单元测试
 └── README.md
 ```
 
@@ -75,7 +87,70 @@ python -m AIchess train \
     --elo_k 32
 ```
 
-### 3. 对弈
+### 3. 引入 Pikafish 对手池训练
+
+提供 `--engine_path` 后，训练将自动启用对手池模式，按课程学习调度对抗不同强度对手：
+
+```bash
+# 最小示例（使用默认课程学习 schedule）
+python -m AIchess train \
+    --engine_path /path/to/pikafish \
+    --num_games 80 \
+    --num_simulations 60 \
+    --num_epochs 2 \
+    --eval_interval 0 \
+    --my_side alternate \
+    --curriculum default
+
+# 完整参数示例（Kaggle P100 建议预设，约 1-2 小时）
+python -m AIchess train \
+    --engine_path /path/to/pikafish \
+    --num_games 200 \
+    --num_simulations 60 \
+    --num_epochs 2 \
+    --batch_size 256 \
+    --max_moves 200 \
+    --my_side alternate \
+    --curriculum default \
+    --pikafish_movetime_weak 30 \
+    --pikafish_movetime_mid 60 \
+    --pikafish_movetime_full 100 \
+    --eval_interval 20 \
+    --eval_games 20 \
+    --eval_gate 0.55 \
+    --save_interval 10
+```
+
+**课程学习阶段（`--curriculum default`）：**
+
+| 训练进度 | 自对弈 | 弱引擎 | 中引擎 | 强引擎 | 历史版本 |
+|---------|--------|--------|--------|--------|---------|
+| 前 1/3  | 100%   | —      | —      | —      | —       |
+| 中 1/3  | 50%    | 30%    | —      | —      | 20%     |
+| 后 1/3  | 30%    | 20%    | 20%    | 10%    | 20%     |
+
+**数据收集策略：**
+- 只收集我方回合（`--my_side`）的训练样本
+- 引擎对手回合不产生训练数据
+- 终局胜负按我方视角回填 value_target
+
+**评测门控（`--eval_gate`）：**
+- 仅当评测 score ≥ gate（默认 0.55）时才更新基准模型
+- 配合 `--eval_opponent previous` 使用，防止策略退化
+
+**新增 CLI 参数一览：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--engine_path` | None | Pikafish 等 UCI 引擎路径；提供后启用对手池 |
+| `--pikafish_movetime_weak` | 30 | 弱强度思考时间（ms） |
+| `--pikafish_movetime_mid` | 60 | 中强度思考时间（ms） |
+| `--pikafish_movetime_full` | 100 | 全强度思考时间（ms） |
+| `--curriculum` | default | 课程策略：`default` 或 `none`（纯自对弈） |
+| `--my_side` | alternate | 我方执哪方：`red`/`black`/`alternate` |
+| `--eval_gate` | 0.55 | 评测门控阈值 |
+
+### 4. 对弈
 
 ```bash
 # 图形界面（需要 Pygame）
@@ -88,7 +163,7 @@ python -m AIchess play_cli --model_path saved_model/model.pth
 python -m AIchess play --human_color black
 ```
 
-### 4. 独立模型评测
+### 5. 独立模型评测
 
 ```bash
 python -m AIchess eval \
@@ -108,7 +183,7 @@ python -m AIchess eval \
 
 若提供 `--out`，结果同时追加到该目录的 `evaluation_metrics.csv`。
 
-### 5. 绘制训练曲线
+### 6. 绘制训练曲线
 
 ```bash
 python -m AIchess plot \
