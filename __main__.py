@@ -5,6 +5,10 @@
     训练模型:
         python -m AIchess train [--num_games 50] [--num_simulations 100]
 
+    策略蒸馏（阶段 A）：
+        python -m AIchess distill --engine_path /path/to/pikafish \\
+            [--out_model saved_model/model_distill.pth] [--n_games 200]
+
     图形界面对弈:
         python -m AIchess play [--model_path path/to/model.pth]
 
@@ -29,13 +33,13 @@ import argparse
 def main():
     parser = argparse.ArgumentParser(
         description='简化中国象棋AI',
-        usage='python -m AIchess {train,play,play_cli,eval,plot,vs_pikafish} [options]'
+        usage='python -m AIchess {train,distill,play,play_cli,eval,plot,vs_pikafish} [options]'
     )
     parser.add_argument('command',
-                        choices=['train', 'play', 'play_cli', 'eval', 'plot',
-                                 'vs_pikafish'],
-                        help='命令: train(训练), play(图形界面), play_cli(命令行), '
-                             'eval(模型评测), plot(绘制训练曲线), '
+                        choices=['train', 'distill', 'play', 'play_cli', 'eval',
+                                 'plot', 'vs_pikafish'],
+                        help='命令: train(训练), distill(策略蒸馏), play(图形界面), '
+                             'play_cli(命令行), eval(模型评测), plot(绘制训练曲线), '
                              'vs_pikafish(与UCI引擎对弈)')
 
     args, remaining = parser.parse_known_args()
@@ -44,6 +48,10 @@ def main():
         from .train import main as train_main
         sys.argv = [sys.argv[0]] + remaining
         train_main()
+    elif args.command == 'distill':
+        from .distill import main as distill_main
+        sys.argv = [sys.argv[0]] + remaining
+        distill_main()
     elif args.command == 'play':
         from .gui import main as gui_main
         sys.argv = [sys.argv[0]] + remaining

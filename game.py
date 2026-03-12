@@ -125,7 +125,21 @@ class ChessGame:
     维护棋盘状态，提供走法生成、走子、胜负判断等功能。
     """
 
-    def __init__(self):
+    def __init__(self, repetition_draw_threshold: int = 3):
+        """
+        Args:
+            repetition_draw_threshold: 重复局面判和的阈值（≥ 3）。默认 3，即第三次出现
+                同一局面时（若无长将/长捉）判和。训练时可调大（如 5 或 6）以减少短局
+                重复判和，获得更丰富的训练信号。
+
+        Raises:
+            ValueError: 当 repetition_draw_threshold < 3 时抛出。
+        """
+        if repetition_draw_threshold < 3:
+            raise ValueError(
+                f"repetition_draw_threshold 必须 >= 3，得到 {repetition_draw_threshold}"
+            )
+        self.repetition_draw_threshold = repetition_draw_threshold
         self.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
         self.red_to_move = True
         self.winner = None  # 'red', 'black', 'draw', or None
@@ -829,10 +843,11 @@ class ChessGame:
         self.pos_hash ^= _ZOBRIST_SIDE
         self.red_to_move = not self.red_to_move
 
-        # 检测重复局面
+        # 检测重复局面（count 为当前局面在历史中已出现的次数；
+        # threshold=3 时第3次出现触发，即 count >= threshold-1）
         if self.winner is None:
             count = self.pos_history.count(self.pos_hash)
-            if count >= 2:  # 将成为第3次出现
+            if count >= (self.repetition_draw_threshold - 1):  # 将成为第 threshold 次出现
                 perp_result = self._detect_perpetual_check()
                 if perp_result == 'red_loses':
                     self.winner = 'black'

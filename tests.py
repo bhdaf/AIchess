@@ -389,10 +389,14 @@ class TestTraining(unittest.TestCase):
         from .train import self_play_game
         model = ChessModel(num_channels=32, num_res_blocks=2)
         model.build()
-        data, winner, moves = self_play_game(model, num_simulations=5, max_moves=30)
+        data, winner, moves, terminate_reason = self_play_game(
+            model, num_simulations=5, max_moves=30
+        )
         self.assertIsInstance(data, list)
         self.assertGreater(len(data), 0)
         self.assertIsInstance(moves, int)
+        # terminate_reason 为 None 或字符串
+        self.assertTrue(terminate_reason is None or isinstance(terminate_reason, str))
         # 每个样本应是 (planes, policy, value) 三元组
         for planes, policy, value in data:
             self.assertEqual(planes.shape, (14, 10, 9))
@@ -916,6 +920,235 @@ class TestRepetitionDetection(unittest.TestCase):
                       "红车在(2,5)应攻击黑马(3,5)")
         self.assertNotIn((4, 9), chased,
                          "将/帅不参与捉子计算")
+
+
+class TestRepetitionDrawThreshold(unittest.TestCase):
+    """测试重复局面判和阈值（repetition_draw_threshold）"""
+
+    # 循环走法（炮来回）：每 4 步返回同一局面
+    MOVES_CYCLE = [
+        '1213',  # 红炮上
+        '1716',  # 黑炮下
+        '1312',  # 红炮回
+        '1617',  # 黑炮回 → 回到初始局面（第2次出现）
+        '1213',
+        '1716',
+        '1312',
+        '1617',  # 第3次出现
+        '1213',
+        '1716',
+        '1312',
+        '1617',  # 第4次出现
+        '1213',
+        '1716',
+        '1312',
+        '1617',  # 第5次出现
+    ]
+
+    def _play_n_cycles(self, game, n_cycles):
+        """执行 n_cycles 轮循环走法（每轮 4 步）"""
+        steps_done = 0
+        for move in self.MOVES_CYCLE[:n_cycles * 4]:
+            if game.done:
+                break
+            game.step(move)
+            steps_done += 1
+        return steps_done
+
+    def test_invalid_threshold_raises(self):
+        """阈值 < 3 应抛出 ValueError"""
+        with self.assertRaises(ValueError):
+            ChessGame(repetition_draw_threshold=2)
+        with self.assertRaises(ValueError):
+            ChessGame(repetition_draw_threshold=1)
+
+    def test_default_threshold_is_3(self):
+        """默认阈值 = 3，三次重复局面判和（两轮循环后第3次出现）"""
+        game = ChessGame()
+        game.reset()
+        self._play_n_cycles(game, 2)  # 两轮循环 → 第3次出现 → draw
+        self.assertTrue(game.done, "默认阈值=3：两轮循环后应已终局")
+        self.assertEqual(game.winner, 'draw',
+                         f"默认阈值应为 draw，实际: winner={game.winner}")
+        self.assertEqual(game.terminate_reason, 'repetition')
+
+    def test_threshold_3_same_as_default(self):
+        """显式 threshold=3 与默认行为一致"""
+        game = ChessGame(repetition_draw_threshold=3)
+        game.reset()
+        self._play_n_cycles(game, 2)
+        self.assertEqual(game.winner, 'draw')
+        self.assertEqual(game.terminate_reason, 'repetition')
+
+    def test_threshold_4_not_draw_after_3_occurrences(self):
+        """threshold=4：第3次重复局面不判和，第4次才判和"""
+        game = ChessGame(repetition_draw_threshold=4)
+        game.reset()
+        # 执行刚好能产生第3次出现的走法（2个完整循环 = 位置出现3次）
+        self._play_n_cycles(game, 2)
+        self.assertFalse(game.done,
+                         "threshold=4：第3次重复后不应判和")
+        # 再走一轮 → 第4次出现 → draw
+        self._play_n_cycles(game, 1)
+        self.assertTrue(game.done, "threshold=4：第4次重复后应判和")
+        self.assertEqual(game.winner, 'draw')
+        self.assertEqual(game.terminate_reason, 'repetition')
+
+    def test_threshold_5_draw_on_5th_occurrence(self):
+        """threshold=5：第5次重复局面才判和（三轮循环后第4次出现，再一轮后第5次出现）"""
+        game = ChessGame(repetition_draw_threshold=5)
+        game.reset()
+        self._play_n_cycles(game, 3)  # 三轮循环 → 第4次出现，不判和
+        self.assertFalse(game.done,
+                         "threshold=5：三轮循环后（第4次出现）不应判和")
+        self._play_n_cycles(game, 1)  # 再一轮 → 第5次出现 → draw
+        self.assertTrue(game.done, "threshold=5：第5次重复后应判和")
+        self.assertEqual(game.winner, 'draw')
+        self.assertEqual(game.terminate_reason, 'repetition')
+
+    def test_threshold_preserved_after_reset(self):
+        """reset() 后阈值不丢失"""
+        game = ChessGame(repetition_draw_threshold=4)
+        game.reset()
+        self.assertEqual(game.repetition_draw_threshold, 4)
+        game.reset()  # 再次 reset
+        self.assertEqual(game.repetition_draw_threshold, 4)
+        # 验证行为：第3次重复不判和
+        self._play_n_cycles(game, 2)
+        self.assertFalse(game.done,
+                         "threshold=4 在 reset() 后仍不应在第3次重复判和")
+
+    def test_reset_clears_history(self):
+        """reset() 后 pos_history/move_history 应被清空，不跨局污染"""
+        game = ChessGame(repetition_draw_threshold=3)
+        game.reset()
+        self._play_n_cycles(game, 2)  # 触发 draw
+        self.assertTrue(game.done)
+
+        # 重置后应恢复干净状态
+        game.reset()
+        self.assertIsNone(game.winner)
+        self.assertFalse(game.done)
+        self.assertEqual(game.num_moves, 0)
+        self.assertEqual(len(game.move_history), 0)
+        # pos_history 初始包含当前局面哈希（来自 _init_hash）
+        self.assertEqual(len(game.pos_history), 1)
+        self.assertIsNone(game.terminate_reason)
+
+
+class TestSelfPlayGameReturns(unittest.TestCase):
+    """验证 self_play_game 返回 4 个值（含 terminate_reason）"""
+
+    def test_returns_four_values(self):
+        """self_play_game 应返回 (training_data, winner, move_count, terminate_reason)"""
+        from .train import self_play_game
+        model = ChessModel(num_channels=32, num_res_blocks=1)
+        model.build()
+        result = self_play_game(model, num_simulations=2, max_moves=10)
+        self.assertEqual(len(result), 4, "self_play_game 应返回 4 个值")
+        training_data, winner, move_count, terminate_reason = result
+        self.assertIsInstance(training_data, list)
+        self.assertIsInstance(move_count, int)
+        # terminate_reason 为 None 或 str
+        self.assertTrue(terminate_reason is None or isinstance(terminate_reason, str))
+
+    def test_repetition_draw_threshold_propagated(self):
+        """self_play_game 的 repetition_draw_threshold 参数应传递给游戏"""
+        from .train import self_play_game
+        model = ChessModel(num_channels=32, num_res_blocks=1)
+        model.build()
+        # 只需验证不报错，threshold 值合法
+        result = self_play_game(model, num_simulations=2, max_moves=10,
+                                repetition_draw_threshold=5)
+        self.assertEqual(len(result), 4)
+
+
+class TestDistillModel(unittest.TestCase):
+    """测试 distill_model 函数"""
+
+    def test_distill_model_policy_only(self):
+        """value_loss_weight=0 时应只训练策略头，返回非负浮点损失"""
+        from .distill import distill_model
+        model = ChessModel(num_channels=32, num_res_blocks=1)
+        model.build()
+
+        # 构造假训练数据：(planes, one-hot policy, value=0)
+        n = 20
+        states = np.random.rand(n, 14, 10, 9).astype(np.float32)
+        policies = np.zeros((n, NUM_ACTIONS), dtype=np.float32)
+        for i in range(n):
+            policies[i, i % NUM_ACTIONS] = 1.0  # one-hot
+        values = np.zeros(n, dtype=np.float32)
+
+        training_data = list(zip(states, policies, values))
+        loss = distill_model(model, training_data, batch_size=8, epochs=1,
+                             value_loss_weight=0.0)
+        self.assertIsInstance(loss, float)
+        self.assertGreaterEqual(loss, 0.0)
+
+    def test_distill_model_empty_data_returns_zero(self):
+        """空训练数据时应返回 0.0"""
+        from .distill import distill_model
+        model = ChessModel(num_channels=32, num_res_blocks=1)
+        model.build()
+        loss = distill_model(model, [], batch_size=8, epochs=1)
+        self.assertEqual(loss, 0.0)
+
+
+class TestGenerateDistillGame(unittest.TestCase):
+    """测试 generate_distill_game 函数（使用随机 Agent 代替 Pikafish）"""
+
+    def _make_random_agent(self):
+        from .pikafish_agent import BaseAgent
+
+        class RandomAgent(BaseAgent):
+            def new_game(self):
+                pass
+
+            def get_move(self, game):
+                legal = game.get_legal_moves()
+                return random.choice(legal) if legal else None
+
+        return RandomAgent()
+
+    def test_returns_correct_format(self):
+        """generate_distill_game 应返回 (training_data, winner, moves, reason)"""
+        from .distill import generate_distill_game
+        agent = self._make_random_agent()
+        result = generate_distill_game(agent, max_moves=20)
+        self.assertEqual(len(result), 4)
+        training_data, winner, moves, terminate_reason = result
+        self.assertIsInstance(training_data, list)
+        self.assertIsInstance(moves, int)
+
+    def test_training_data_shapes(self):
+        """每个样本的 state/policy/value 形状应正确"""
+        from .distill import generate_distill_game
+        agent = self._make_random_agent()
+        training_data, _, _, _ = generate_distill_game(agent, max_moves=20)
+
+        if not training_data:
+            self.skipTest("未产生训练样本（对局过短），跳过形状检验")
+
+        for state, policy, value in training_data:
+            self.assertEqual(state.shape, (14, 10, 9))
+            self.assertEqual(len(policy), NUM_ACTIONS)
+            self.assertAlmostEqual(float(value), 0.0,
+                                   msg="蒸馏阶段 value_target 应恒为 0.0")
+
+    def test_policy_is_one_hot(self):
+        """蒸馏 policy_target 应为 one-hot（恰好 1 个非零项）"""
+        from .distill import generate_distill_game
+        agent = self._make_random_agent()
+        training_data, _, _, _ = generate_distill_game(agent, max_moves=20)
+
+        if not training_data:
+            self.skipTest("未产生训练样本，跳过 one-hot 检验")
+
+        for _state, policy, _value in training_data:
+            nonzero_count = int(np.sum(policy > 0))
+            self.assertEqual(nonzero_count, 1,
+                             "蒸馏 policy_target 应为 one-hot（1 个非零项）")
 
 
 class TestEloUpdate(unittest.TestCase):

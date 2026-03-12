@@ -94,7 +94,8 @@ def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=
     return score, wins_a, wins_b, draws
 
 
-def self_play_game(model, num_simulations=100, max_moves=200, temperature_threshold=30):
+def self_play_game(model, num_simulations=100, max_moves=200, temperature_threshold=30,
+                   repetition_draw_threshold=3):
     """
     执行一局自对弈
 
@@ -103,11 +104,12 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
         num_simulations: MCTS模拟次数
         max_moves: 最大步数（超过判和）
         temperature_threshold: 前N步使用温度1.0探索
+        repetition_draw_threshold: 重复局面判和阈值（传递给 ChessGame，默认 3）
 
     Returns:
         training_data: [(state_planes, policy_target, value_target), ...]
     """
-    game = ChessGame()
+    game = ChessGame(repetition_draw_threshold=repetition_draw_threshold)
     game.reset()
     mcts = MCTS(model, num_simulations=num_simulations)
 
@@ -159,13 +161,13 @@ def self_play_game(model, num_simulations=100, max_moves=200, temperature_thresh
         value = winner * player
         training_data.append((state, policy, value))
 
-    return training_data, game.winner, move_count
+    return training_data, game.winner, move_count, game.terminate_reason
 
 
 def play_game_vs_opponent_collect_my_turn(
     model, opponent_agent, my_side='alternate', game_idx=0,
     num_simulations=100, max_moves=200, temperature_threshold=30,
-    add_noise=True,
+    add_noise=True, repetition_draw_threshold=3,
 ):
     """
     与对手 Agent 对弈，只收集我方回合的训练样本。
@@ -185,6 +187,7 @@ def play_game_vs_opponent_collect_my_turn(
         max_moves: 最大步数（超过判和）。
         temperature_threshold: 前 N 步使用温度 1.0 探索。
         add_noise: 是否向我方 MCTS 根节点注入 Dirichlet 噪声（训练时建议 True）。
+        repetition_draw_threshold: 重复局面判和阈值（传递给 ChessGame，默认 3）。
 
     Returns:
         training_data: ``[(state_planes, policy_target, value_target), ...]``
@@ -192,7 +195,7 @@ def play_game_vs_opponent_collect_my_turn(
         move_count: 实际步数（int）
         metadata: 描述字典，含 ``my_side``、``num_my_samples``
     """
-    game = ChessGame()
+    game = ChessGame(repetition_draw_threshold=repetition_draw_threshold)
     game.reset()
 
     # 确定我方执哪方
@@ -283,6 +286,7 @@ def play_game_vs_opponent_collect_my_turn(
     metadata = {
         'my_side': 'red' if i_am_red else 'black',
         'num_my_samples': len(training_data),
+        'terminate_reason': game.terminate_reason,
     }
 
     return training_data, winner_raw, move_count, metadata
@@ -389,7 +393,10 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  curriculum='default',
                  my_side='alternate',
                  eval_gate=0.55,
-                 engine_options=None):
+                 engine_options=None,
+                 # 阶段 B：从蒸馏模型启动 / 放宽重复判和
+                 init_from_distill=None,
+                 repetition_draw_threshold=3):
     """
     运行完整的训练流程
 
@@ -418,6 +425,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         eval_gate: 评测得分门控阈值（仅 eval_opponent='previous' 时生效，
                    score >= gate 才更新基准模型；默认 0.55）
         engine_options: 传给 UCI 引擎的选项字典
+        init_from_distill: 蒸馏模型路径；若指定，则**优先**以该权重为 RL 微调起点，
+                           并覆盖写入 model_path（若 model_path 已存在旧权重，会被替换）。
+                           典型用法：先运行 ``distill`` 命令生成蒸馏权重，再用此参数
+                           启动阶段 B RL 微调。
+        repetition_draw_threshold: 重复局面判和阈值（>= 3）；训练时可调大（如 5 或 6）
+                                   以减少短局重复判和，获得更丰富的训练信号（默认 3）。
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
@@ -433,7 +446,14 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
 
     # 初始化模型
     model = ChessModel(num_channels=128, num_res_blocks=4)
-    if os.path.exists(model_path):
+    if init_from_distill and os.path.exists(init_from_distill):
+        # 阶段 B：以蒸馏权重为起点（忽略 model_path 中可能存在的旧权重）
+        print(f"从蒸馏模型加载权重: {init_from_distill}")
+        model.load(init_from_distill)
+        os.makedirs(model_dir, exist_ok=True)
+        model.save(model_path)
+        print(f"蒸馏权重已复制到: {model_path}")
+    elif os.path.exists(model_path):
         print(f"加载已有模型: {model_path}")
         model.load(model_path)
     else:
@@ -459,9 +479,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         curriculum=curriculum,
         my_side=my_side,
         eval_gate=eval_gate,
+        init_from_distill=init_from_distill,
+        repetition_draw_threshold=repetition_draw_threshold,
     )
     run_dir = init_run_dir(config=training_config)
     print(f"日志目录: {run_dir}")
+    print(f"重复判和阈值: {repetition_draw_threshold}")
 
     # 初始化评测状态（含 ELO）
     eval_state = load_evaluation_state(run_dir)
@@ -520,6 +543,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                     game_idx=game_idx - 1,
                     num_simulations=num_simulations,
                     max_moves=max_moves,
+                    repetition_draw_threshold=repetition_draw_threshold,
                 )
 
                 # 合并元数据
@@ -527,10 +551,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 opp_strength_log = opp_meta.get('opponent_strength', '')
                 engine_movetime_log = opp_meta.get('engine_movetime')
                 my_side_log = game_meta.get('my_side', my_side)
+                terminate_reason_log = game_meta.get('terminate_reason')
             else:
                 # 原有自对弈模式（不提供 engine_path 时）
-                data, winner, moves = self_play_game(
-                    model, num_simulations=num_simulations, max_moves=max_moves
+                data, winner, moves, terminate_reason_log = self_play_game(
+                    model, num_simulations=num_simulations, max_moves=max_moves,
+                    repetition_draw_threshold=repetition_draw_threshold,
                 )
                 opp_type_log = 'self_play'
                 opp_strength_log = 'current'
@@ -551,6 +577,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                   f"对手: {opp_type_log}, "
                   f"胜方: {winner or '和棋'}, "
                   f"步数: {moves}, "
+                  f"原因: {terminate_reason_log or '-'}, "
                   f"缓冲区: {len(data_buffer)}, "
                   f"耗时: {elapsed:.1f}s")
 
@@ -558,6 +585,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 'game_idx': game_idx,
                 'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
                 'winner': winner or 'draw',
+                'terminate_reason': terminate_reason_log,
                 'num_moves': moves,
                 'num_samples': len(data),
                 'elapsed_s': round(elapsed, 2),
@@ -711,6 +739,13 @@ def main():
                         help='我方执哪方（对手池模式有效，默认: alternate）')
     parser.add_argument('--eval_gate', type=float, default=0.55,
                         help='评测门控阈值：score >= gate 才更新基准模型 (默认: 0.55)')
+    # 阶段 B：从蒸馏模型启动 / 放宽重复判和
+    parser.add_argument('--init_from_distill', type=str, default=None,
+                        help='蒸馏模型路径；指定后以蒸馏权重为起点进行 RL 微调 '
+                             '（优先级高于 --model_path 中已有权重）')
+    parser.add_argument('--repetition_draw_threshold', type=int, default=3,
+                        help='重复局面判和阈值（>= 3）；训练时可调大（如 5 或 6）'
+                             '以减少短局重复判和，获得更丰富的训练信号 (默认: 3)')
 
     args = parser.parse_args()
     run_training(**vars(args))
