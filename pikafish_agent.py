@@ -33,6 +33,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Optional
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -154,6 +156,67 @@ def game_to_uci_fen(game) -> str:
 # Pikafish / 通用 UCI Agent
 # ---------------------------------------------------------------------------
 
+
+def parse_multipv_info(info_lines: list) -> list:
+    """
+    解析 MultiPV 搜索返回的 info 行，提取各候选走法及其评分。
+
+    每行格式（节选）：
+        ``info depth N ... multipv K score cp SCORE ... pv MOVE ...``
+
+    ``score mate N`` 情形将映射为 ``±10000`` cp。
+
+    Args:
+        info_lines: UCIEngine 搜索期间输出的 info 行列表。
+
+    Returns:
+        按 multipv 排名（1=最优）排序的列表，每项为
+        ``(uci_move: str, score_cp: int)``。
+    """
+    candidates: dict = {}
+    for line in info_lines:
+        if 'multipv' not in line:
+            continue
+        parts = line.split()
+        try:
+            multipv_rank = int(parts[parts.index('multipv') + 1])
+        except (ValueError, IndexError):
+            continue
+
+        score_cp = None
+        try:
+            if 'score' in parts:
+                score_idx = parts.index('score')
+                score_type = parts[score_idx + 1] if score_idx + 1 < len(parts) else None
+                score_val = parts[score_idx + 2] if score_idx + 2 < len(parts) else None
+                if score_type == 'cp' and score_val is not None:
+                    score_cp = int(score_val)
+                elif score_type == 'mate' and score_val is not None:
+                    n = int(score_val)
+                    score_cp = 10000 if n > 0 else -10000
+        except (ValueError, IndexError):
+            pass
+
+        pv_move = None
+        try:
+            if 'pv' in parts:
+                pv_idx = parts.index('pv')
+                if pv_idx + 1 < len(parts):
+                    pv_move = parts[pv_idx + 1]
+        except (ValueError, IndexError):
+            pass
+
+        if score_cp is not None and pv_move is not None:
+            # Keep only the first entry per multipv rank; info lines are
+            # typically emitted in ascending depth order so the last entry
+            # at each rank would be the deepest — but since we need just one
+            # representative per rank, the first occurrence (lowest depth)
+            # is sufficient for soft-target construction.
+            if multipv_rank not in candidates:
+                candidates[multipv_rank] = (pv_move, score_cp)
+
+    return [candidates[k] for k in sorted(candidates.keys())]
+
 class PikafishAgent(BaseAgent):
     """
     Pikafish（或任意兼容 UCI 协议的中国象棋引擎）Agent。
@@ -189,6 +252,7 @@ class PikafishAgent(BaseAgent):
         options: Optional[dict] = None,
         init_timeout: float = 10.0,
         move_timeout: float = 5.0,
+        multipv: int = 1,
     ) -> None:
         from .uci import UCIEngine  # 延迟导入，降低无引擎时的依赖成本
 
@@ -196,6 +260,7 @@ class PikafishAgent(BaseAgent):
         self.movetime_ms = movetime_ms
         self.depth = depth
         self.options = options or {}
+        self.multipv = max(1, int(multipv))
         self._engine = UCIEngine(
             engine_path,
             init_timeout=init_timeout,
@@ -211,6 +276,8 @@ class PikafishAgent(BaseAgent):
         self._engine.start()
         for name, value in self.options.items():
             self._engine.set_option(name, str(value))
+        if self.multipv > 1:
+            self._engine.set_option("MultiPV", str(self.multipv))
 
     def quit(self) -> None:
         """关闭引擎子进程。"""
@@ -273,3 +340,110 @@ class PikafishAgent(BaseAgent):
             return None
 
         return internal_move
+
+    def get_move_with_info(self, game) -> tuple:
+        """
+        给定当前局面，调用引擎并返回 ``(内部格式走法, info_lines)``。
+
+        info_lines 包含搜索期间引擎输出的所有 ``info`` 行，可用于 MultiPV 解析。
+
+        Args:
+            game: :class:`~AIchess.game.ChessGame` 实例。
+
+        Returns:
+            ``(internal_move, info_lines)``：走法字符串或 ``None``；info 行列表。
+        """
+        uci_fen = game_to_uci_fen(game)
+        self._engine.set_position(uci_fen)
+
+        if self.depth is not None:
+            uci_move, info_lines = self._engine.go_depth_with_info(self.depth)
+        else:
+            uci_move, info_lines = self._engine.go_movetime_with_info(self.movetime_ms)
+
+        if uci_move is None:
+            logger.warning("引擎未返回走法（局面：%s）", uci_fen)
+            return None, info_lines
+
+        try:
+            internal_move = uci_to_internal(uci_move)
+        except ValueError as exc:
+            logger.error("无法解析引擎走法 %r：%s", uci_move, exc)
+            return None, info_lines
+
+        legal = game.get_legal_moves()
+        if internal_move not in legal:
+            logger.warning(
+                "引擎走法 %r（内部：%r）不在合法走法列表中。",
+                uci_move, internal_move,
+            )
+            return None, info_lines
+
+        return internal_move, info_lines
+
+    def get_soft_policy(self, game, k: int = 5,
+                        temperature: float = 1.0) -> "np.ndarray | None":
+        """
+        使用 MultiPV 搜索为当前局面构造 soft policy 概率分布。
+
+        该方法会利用引擎在搜索时输出的 ``info multipv`` 行，提取 top-k 候选
+        走法及其评分，通过带温度的 softmax 转换为概率分布。
+
+        This method temporarily changes the engine's ``MultiPV`` option and is
+        **not thread-safe**. Do not call it concurrently from multiple threads
+        on the same ``PikafishAgent`` instance.
+
+        Args:
+            game:        :class:`~AIchess.game.ChessGame` 实例（当前局面）。
+            k:           MultiPV 候选数量（默认 5）；实际数量受引擎支持上限约束。
+            temperature: 分数温度（越高分布越平，越低越尖锐）；默认 1.0。
+
+        Returns:
+            ``np.ndarray`` of shape ``(NUM_ACTIONS,)``，float32，sum ≈ 1；
+            或在无有效候选时返回 ``None``。
+        """
+        from .game import NUM_ACTIONS, LABEL_TO_INDEX, flip_move
+
+        # 若当前设置的 MultiPV < k，临时提升；搜索后恢复
+        actual_k = max(k, self.multipv)
+        if actual_k != self.multipv:
+            self._engine.set_option("MultiPV", str(actual_k))
+
+        _move, info_lines = self.get_move_with_info(game)
+
+        if actual_k != self.multipv:
+            self._engine.set_option("MultiPV", str(self.multipv))
+
+        candidates = parse_multipv_info(info_lines)
+        if not candidates:
+            return None
+
+        is_black = not game.red_to_move
+        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        indices = []
+        scores = []
+
+        for uci_mv, score_cp in candidates:
+            try:
+                internal_mv = uci_to_internal(uci_mv)
+            except ValueError:
+                continue
+            policy_mv = flip_move(internal_mv) if is_black else internal_mv
+            if policy_mv not in LABEL_TO_INDEX:
+                continue
+            indices.append(LABEL_TO_INDEX[policy_mv])
+            scores.append(float(score_cp))
+
+        if not indices:
+            return None
+
+        # Softmax with temperature (centipawns / 100 / T)
+        arr = np.array(scores, dtype=np.float64) / 100.0 / max(temperature, 1e-6)
+        arr -= arr.max()  # numerical stability
+        probs = np.exp(arr)
+        probs /= probs.sum()
+
+        for idx, prob in zip(indices, probs):
+            policy[idx] += float(prob)
+
+        return policy
