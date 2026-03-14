@@ -131,11 +131,8 @@ class UCIEngine:
             引擎返回的走法字符串（ICCS 格式，如 ``"h2e2"``），或在超时 / 错误
             时返回 ``None``。
         """
-        with self._lock:
-            self._lines.clear()
-        self._send(f"go movetime {movetime_ms}")
-        timeout = movetime_ms / 1000.0 + self.move_timeout
-        return self._wait_for_bestmove(timeout=timeout)
+        bestmove, _info = self.go_movetime_with_info(movetime_ms)
+        return bestmove
 
     def go_depth(self, depth: int) -> str | None:
         """
@@ -147,10 +144,40 @@ class UCIEngine:
         Returns:
             走法字符串或 ``None``。
         """
+        bestmove, _info = self.go_depth_with_info(depth)
+        return bestmove
+
+    def go_movetime_with_info(self, movetime_ms: int) -> tuple:
+        """
+        以固定思考时间搜索，返回最佳走法及搜索期间的 info 行列表。
+
+        Args:
+            movetime_ms: 思考时间（毫秒）。
+
+        Returns:
+            ``(bestmove, info_lines)``：bestmove 为走法字符串或 ``None``；
+            info_lines 为搜索期间所有以 ``"info"`` 开头的输出行。
+        """
+        with self._lock:
+            self._lines.clear()
+        self._send(f"go movetime {movetime_ms}")
+        timeout = movetime_ms / 1000.0 + self.move_timeout
+        return self._wait_for_bestmove_with_info(timeout=timeout)
+
+    def go_depth_with_info(self, depth: int) -> tuple:
+        """
+        以固定深度搜索，返回最佳走法及搜索期间的 info 行列表。
+
+        Args:
+            depth: 搜索深度。
+
+        Returns:
+            ``(bestmove, info_lines)``。
+        """
         with self._lock:
             self._lines.clear()
         self._send(f"go depth {depth}")
-        return self._wait_for_bestmove(timeout=60.0)
+        return self._wait_for_bestmove_with_info(timeout=60.0)
 
     def set_option(self, name: str, value: str) -> None:
         """设置引擎选项，例如 UCI_Elo / Skill Level 等。"""
@@ -197,15 +224,28 @@ class UCIEngine:
 
     def _wait_for_bestmove(self, timeout: float) -> str | None:
         """阻塞等待 bestmove 行并解析走法。"""
+        bestmove, _info = self._wait_for_bestmove_with_info(timeout)
+        return bestmove
+
+    def _wait_for_bestmove_with_info(self, timeout: float) -> tuple:
+        """
+        阻塞等待 bestmove 行，同时收集搜索期间的 info 行。
+
+        Returns:
+            ``(bestmove, info_lines)``：bestmove 为走法字符串或 ``None``；
+            info_lines 为 bestmove 之前所有以 ``"info"`` 开头的行。
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
-                for line in self._lines:
+                for i, line in enumerate(self._lines):
                     if line.startswith("bestmove"):
                         parts = line.split()
                         move = parts[1] if len(parts) >= 2 else None
-                        # "bestmove (none)" 表示引擎无合法走法
-                        return None if move in (None, "(none)") else move
+                        bestmove = None if move in (None, "(none)") else move
+                        info_lines = [l for l in self._lines[:i]
+                                      if l.startswith("info")]
+                        return bestmove, info_lines
             time.sleep(0.01)
         logger.warning("Timed out waiting for bestmove (%.1fs)", timeout)
-        return None
+        return None, []

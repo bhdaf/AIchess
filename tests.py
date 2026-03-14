@@ -1136,19 +1136,156 @@ class TestGenerateDistillGame(unittest.TestCase):
             self.assertAlmostEqual(float(value), 0.0,
                                    msg="蒸馏阶段 value_target 应恒为 0.0")
 
-    def test_policy_is_one_hot(self):
-        """蒸馏 policy_target 应为 one-hot（恰好 1 个非零项）"""
+    def test_policy_is_soft_distribution(self):
+        """蒸馏 policy_target 应为 soft 概率分布（非 one-hot，sum≈1，多个非零项）"""
         from .distill import generate_distill_game
         agent = self._make_random_agent()
         training_data, _, _, _ = generate_distill_game(agent, max_moves=20)
 
         if not training_data:
-            self.skipTest("未产生训练样本，跳过 one-hot 检验")
+            self.skipTest("未产生训练样本，跳过 soft 分布检验")
 
         for _state, policy, _value in training_data:
+            # 概率分布：sum ≈ 1，所有元素 ≥ 0
+            self.assertAlmostEqual(float(np.sum(policy)), 1.0, places=5,
+                                   msg="soft policy_target 的概率总和应约为 1.0")
+            self.assertTrue(np.all(policy >= 0),
+                            "soft policy_target 所有元素应 ≥ 0")
+            # soft target：至少有 2 个非零项（非 one-hot）
             nonzero_count = int(np.sum(policy > 0))
-            self.assertEqual(nonzero_count, 1,
-                             "蒸馏 policy_target 应为 one-hot（1 个非零项）")
+            self.assertGreater(nonzero_count, 1,
+                               "soft policy_target 应有多于 1 个非零项（非 one-hot）")
+
+    def test_generate_distill_game_with_teacher(self):
+        """独立 teacher agent 提供标注时，policy 应为 soft 分布"""
+        from .distill import generate_distill_game
+        weak_agent = self._make_random_agent()
+        teacher_agent = self._make_random_agent()
+        training_data, _, _, _ = generate_distill_game(
+            weak_agent, teacher_agent=teacher_agent, max_moves=20,
+        )
+
+        if not training_data:
+            self.skipTest("未产生训练样本，跳过 teacher soft 分布检验")
+
+        for _state, policy, _value in training_data:
+            self.assertAlmostEqual(float(np.sum(policy)), 1.0, places=5)
+            self.assertTrue(np.all(policy >= 0))
+
+
+class TestParseMultipvInfo(unittest.TestCase):
+    """测试 parse_multipv_info 函数"""
+
+    def test_parse_basic_multipv(self):
+        """标准 MultiPV info 行解析"""
+        from .pikafish_agent import parse_multipv_info
+        info_lines = [
+            "info depth 10 seldepth 12 multipv 1 score cp 50 nodes 1000 nps 500000 time 2 pv h2e2 e9e8",
+            "info depth 10 seldepth 12 multipv 2 score cp 30 nodes 1000 nps 500000 time 2 pv b0c2 b9c7",
+            "info depth 10 seldepth 12 multipv 3 score cp -10 nodes 1000 nps 500000 time 2 pv a0a1 a9a8",
+        ]
+        result = parse_multipv_info(info_lines)
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0][0], "h2e2")
+        self.assertEqual(result[0][1], 50)
+        self.assertEqual(result[1][0], "b0c2")
+        self.assertEqual(result[1][1], 30)
+        self.assertEqual(result[2][1], -10)
+
+    def test_parse_mate_score(self):
+        """score mate 应映射为 ±10000"""
+        from .pikafish_agent import parse_multipv_info
+        info_lines = [
+            "info depth 5 multipv 1 score mate 3 pv e0e1",
+            "info depth 5 multipv 2 score mate -2 pv h0g2",
+        ]
+        result = parse_multipv_info(info_lines)
+        self.assertEqual(result[0][1], 10000)
+        self.assertEqual(result[1][1], -10000)
+
+    def test_parse_no_multipv_lines(self):
+        """无 multipv 字段的 info 行应返回空列表"""
+        from .pikafish_agent import parse_multipv_info
+        info_lines = [
+            "info depth 5 score cp 20 nodes 500 pv h2e2",
+        ]
+        result = parse_multipv_info(info_lines)
+        self.assertEqual(result, [])
+
+    def test_parse_empty(self):
+        """空输入应返回空列表"""
+        from .pikafish_agent import parse_multipv_info
+        self.assertEqual(parse_multipv_info([]), [])
+
+
+class TestSoftPolicyHelpers(unittest.TestCase):
+    """测试 _build_soft_policy_from_candidates 和 _build_soft_policy_fallback"""
+
+    def test_build_from_candidates_red(self):
+        """红方视角：候选走法直接映射"""
+        from .distill import _build_soft_policy_from_candidates
+        from .game import ACTION_LABELS
+
+        # 取两个已知合法走法
+        move1 = ACTION_LABELS[0]
+        move2 = ACTION_LABELS[1]
+        candidates = [(move1, 100), (move2, 50)]
+        policy = _build_soft_policy_from_candidates(
+            candidates, is_black_to_move=False, temperature=1.0
+        )
+        self.assertIsNotNone(policy)
+        self.assertEqual(len(policy), NUM_ACTIONS)
+        self.assertAlmostEqual(float(np.sum(policy)), 1.0, places=5)
+        self.assertTrue(np.all(policy >= 0))
+        self.assertGreater(float(policy[0]), float(policy[1]),
+                           "分数高的走法应有更高概率")
+
+    def test_build_fallback_has_multiple_nonzero(self):
+        """软回退策略应有多个非零项（非 one-hot）"""
+        from .distill import _build_soft_policy_fallback
+        from .game import ChessGame
+
+        game = ChessGame()
+        game.reset()
+        legal = game.get_legal_moves()
+        bestmove = legal[0]
+
+        policy = _build_soft_policy_fallback(
+            bestmove, legal, is_black_to_move=False
+        )
+        self.assertIsNotNone(policy)
+        self.assertAlmostEqual(float(np.sum(policy)), 1.0, places=5)
+        nonzero = int(np.sum(policy > 0))
+        self.assertGreater(nonzero, 1,
+                           "软回退策略应有多个非零项（非 one-hot）")
+
+    def test_build_fallback_best_move_has_highest_prob(self):
+        """软回退策略中 bestmove 应具有最高概率"""
+        from .distill import _build_soft_policy_fallback
+        from .game import ChessGame, LABEL_TO_INDEX
+
+        game = ChessGame()
+        game.reset()
+        legal = game.get_legal_moves()
+        bestmove = legal[0]
+
+        policy = _build_soft_policy_fallback(
+            bestmove, legal, is_black_to_move=False
+        )
+        self.assertIsNotNone(policy)
+        best_idx = LABEL_TO_INDEX[bestmove]
+        self.assertEqual(
+            int(np.argmax(policy)), best_idx,
+            "软回退策略中 bestmove 应具有最高概率",
+        )
+
+    def test_build_from_empty_candidates_returns_none(self):
+        """空候选列表应返回 None"""
+        from .distill import _build_soft_policy_from_candidates
+        result = _build_soft_policy_from_candidates(
+            [], is_black_to_move=False
+        )
+        self.assertIsNone(result)
 
 
 class TestEloUpdate(unittest.TestCase):
