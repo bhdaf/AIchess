@@ -173,6 +173,8 @@ class MCTS:
             else:
                 # 从当前走子方视角看：对手赢了 = -1
                 value = -1.0
+            # 与非终局情形保持一致：翻转到父节点视角再回传
+            value = -value
         else:
             # 获取合法走法（在网络调用前计算，用于掩码）
             legal_moves = game.get_legal_moves()
