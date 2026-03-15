@@ -350,6 +350,114 @@ class TestMCTS(unittest.TestCase):
         # Should not crash
         self.assertIsNotNone(mcts.root)
 
+    def test_terminal_value_backprop_win(self):
+        """终局胜利值回传：simulate 应使叶子节点 q_value > 0（从父节点视角）
+
+        设置已结束的红方获胜局面（game.winner='red', game.red_to_move=False
+        即黑方＝输家为当前走子方），直接调用 _simulate。修复前终局值
+        value=-1.0 未翻转，导致叶子 q_value=-1.0（父节点认为胜利走法是坏的）；
+        修复后正确翻转为 1.0，父节点才会优先选择致胜走法。
+        """
+        model = ChessModel(num_channels=32, num_res_blocks=2)
+        model.build()
+
+        # 构造红方已胜的终局：game.winner='red', game.red_to_move=False（黑=输家）
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        game.board[0][3] = 'K'   # 红帅在(3,0)
+        game.board[9][4] = 'k'   # 黑将在(4,9)
+        game.winner = 'red'
+        game.red_to_move = False  # 黑方（输家）本该走子
+
+        mcts = MCTS(model, num_simulations=1)
+        node = MCTSNode()
+        mcts._simulate(game.copy(), node, None)
+
+        # 修复后：节点 q_value 应 > 0（父节点视角：进入此终局是好事）
+        self.assertGreater(
+            node.q_value, 0.0,
+            f"终局胜利后叶子节点 q_value({node.q_value:.3f}) 应 > 0；"
+            "若为 -1.0 说明终局值未翻转（bug 未修复）"
+        )
+
+    def test_terminal_value_backprop_loss(self):
+        """终局失败值回传：从父节点（获胜方）视角看，叶子节点 q_value 应为正
+
+        game.winner='black'，game.red_to_move=True（红方＝输家，黑方是上一步的走棋方）。
+        到达此终局的"父节点"是黑方（刚走出获胜棋）。修复后父节点视角 q=1.0>0；
+        修复前由于未翻转，q=-1.0<0，导致 MCTS 错误地"避开"此获胜走法。
+        """
+        model = ChessModel(num_channels=32, num_res_blocks=2)
+        model.build()
+
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        game.board[0][3] = 'K'
+        game.board[9][4] = 'k'
+        game.winner = 'black'
+        game.red_to_move = True  # 红方（输家）本该走子
+
+        mcts = MCTS(model, num_simulations=1)
+        node = MCTSNode()
+        mcts._simulate(game.copy(), node, None)
+
+        # 修复后：父节点（黑方获胜者）视角的 q_value 应为正
+        self.assertGreater(
+            node.q_value, 0.0,
+            f"终局（黑方胜）叶子节点 q_value({node.q_value:.3f}) 应 > 0；"
+            "若为 -1.0 说明终局值未翻转（bug 未修复）"
+        )
+
+    def test_terminal_draw_backprop(self):
+        """终局平局值回传：simulate 应使叶子节点 q_value == 0"""
+        model = ChessModel(num_channels=32, num_res_blocks=2)
+        model.build()
+
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        game.board[0][3] = 'K'
+        game.board[9][4] = 'k'
+        game.winner = 'draw'
+        game.red_to_move = True
+
+        mcts = MCTS(model, num_simulations=1)
+        node = MCTSNode()
+        mcts._simulate(game.copy(), node, None)
+
+        self.assertAlmostEqual(node.q_value, 0.0, places=6,
+                               msg="平局时叶子节点 q_value 应为 0")
+
+    def test_winning_move_preferred(self):
+        """MCTS 应优先选择能立即吃掉对方将的走法
+
+        红车在(1,9)，黑将在(4,9)，红帅在(3,0)；走法"1949"可立即获胜。
+        运行足够多模拟后，"1949"应成为访问次数最多的走法（temperature=0 时被选中）。
+        """
+        model = ChessModel(num_channels=32, num_res_blocks=2)
+        model.build()
+
+        game = ChessGame()
+        game.board = [[None] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        game.board[0][3] = 'K'   # 红帅在(3,0)，不与黑将同列
+        game.board[9][4] = 'k'   # 黑将在(4,9)
+        game.board[9][1] = 'R'   # 红车在(1,9)，走"1949"可吃黑将
+        game.red_to_move = True
+        game._init_hash()
+
+        mcts = MCTS(model, num_simulations=200, c_puct=1.5)
+        actions, probs = mcts.get_action_probs(game, temperature=0.0, add_noise=False)
+
+        self.assertIn('1949', actions, "红车吃将走法'1949'应在合法走法中")
+        winning_child = mcts.root.children.get('1949')
+        self.assertIsNotNone(winning_child, "'1949' 节点应已被探索")
+        self.assertGreater(
+            winning_child.q_value, 0.0,
+            f"获胜走法'1949'的 q_value({winning_child.q_value:.3f}) 应 > 0"
+        )
+        best_action = actions[int(np.argmax(probs))]
+        self.assertEqual(best_action, '1949',
+                         f"MCTS 应选择立即获胜的走法'1949'，实际选择了'{best_action}'")
+
 
 class TestGameCopy(unittest.TestCase):
     """测试游戏状态拷贝"""
