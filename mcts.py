@@ -14,6 +14,8 @@
 """
 
 import math
+from typing import Optional
+
 import numpy as np
 
 from .game import (
@@ -55,18 +57,20 @@ class MCTS:
     """
 
     def __init__(self, model, num_simulations=200, c_puct=1.5,
-                 dirichlet_alpha=0.3, dirichlet_weight=0.25, cache_size=0):
+                 dirichlet_alpha=0.15, dirichlet_weight=0.25, cache_size=0,
+                 debug_mcts: bool = False):
         self.model = model
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_weight = dirichlet_weight
         self.cache_size = cache_size  # 0 = 禁用缓存
+        self.debug_mcts = debug_mcts
         self.root = MCTSNode()
         self._cache_hits = 0  # 当次搜索命中次数（供日志统计）
 
     def get_action_probs(self, game, temperature=1.0, add_noise=False,
-                         reset_root=True):
+                         reset_root=True, mode: Optional[str] = None):
         """
         运行MCTS搜索并返回走法概率分布
 
@@ -78,11 +82,23 @@ class MCTS:
                         True  — 每次搜索从空树开始，保证与当前局面匹配；
                         False — 保留上次子树统计（树复用模式），须配合
                                 update_with_move() 手动推进 root。
+            mode: 运行模式，可选值：
+                  "eval"      — 强制 add_noise=False, temperature=0.0（确定性）
+                  "self_play" — 强制 add_noise=True，temperature 由调用方提供
+                  None        — 使用调用方传入的 temperature/add_noise（兼容原有行为）
 
         Returns:
             actions: 走法列表
             probs: 对应的概率列表
         """
+        # 根据 mode 覆盖 add_noise / temperature
+        if mode == "eval":
+            add_noise = False
+            temperature = 0.0
+        elif mode == "self_play":
+            add_noise = True
+        # mode is None → keep caller-provided values
+
         # 每次搜索前重置 root（默认开启，保证正确性）
         if reset_root:
             self.root = MCTSNode()
@@ -121,6 +137,10 @@ class MCTS:
             else:
                 probs = [1.0 / len(actions)] * len(actions)
 
+        # 打印根节点统计（仅调试模式）
+        if self.debug_mcts:
+            self._print_root_stats(actions, visits)
+
         return actions, probs
 
     def _add_dirichlet_noise(self, node):
@@ -131,7 +151,36 @@ class MCTS:
             return
         noise = np.random.dirichlet([self.dirichlet_alpha] * n)
         for child, eta in zip(children, noise):
-            child.prior = (1 - self.dirichlet_weight) * child.prior + self.dirichlet_weight * eta
+            child.prior = (
+                (1 - self.dirichlet_weight) * child.prior
+                + self.dirichlet_weight * eta
+            )
+
+        if self.debug_mcts:
+            self._print_root_priors_after_noise(node)
+
+    def _print_root_priors_after_noise(self, node):
+        """打印注入噪声后根节点各走法的先验概率（调试用）"""
+        items = sorted(
+            node.children.items(), key=lambda kv: kv[1].prior, reverse=True
+        )
+        print("Root priors after Dirichlet noise:")
+        for action, child in items:
+            print(f"  {action} P={child.prior:.4f}")
+
+    def _print_root_stats(self, actions, visits):
+        """打印根节点各走法的访问次数、Q 值和先验概率（调试用）"""
+        combined = sorted(
+            zip(actions, visits),
+            key=lambda av: av[1],
+            reverse=True,
+        )
+        print("Root visit counts:")
+        for action, vc in combined:
+            child = self.root.children[action]
+            print(
+                f"  {action} {vc:4d} visits  Q={child.q_value:.4f}  P={child.prior:.4f}"
+            )
 
     def update_with_move(self, action):
         """用选择的走法更新树（复用子树）"""
@@ -202,6 +251,9 @@ class MCTS:
                 if cache is not None and len(cache) < self.cache_size:
                     cache[cache_key] = (policy, value)
 
+                if self.debug_mcts:
+                    self._print_network_output(policy, value, legal_moves_flipped)
+
             # 扩展节点
             total_prior = 0.0
             for move in legal_moves_flipped:
@@ -227,6 +279,23 @@ class MCTS:
             path[i].visit_count += 1
             path[i].total_value += value
             value = -value  # 交替翻转
+
+    def _print_network_output(self, policy, value, legal_moves_flipped):
+        """打印神经网络预测输出（调试用）"""
+        print(f"value: {value:.4f}")
+        # policy 已经是合法走法上的 softmax 概率；对合法走法重新归一化（安全检查）
+        legal_probs = []
+        for move in legal_moves_flipped:
+            if move in LABEL_TO_INDEX:
+                idx = LABEL_TO_INDEX[move]
+                legal_probs.append((move, float(policy[idx])))
+        total = sum(p for _, p in legal_probs)
+        if total > 0:
+            legal_probs = [(m, p / total) for m, p in legal_probs]
+        legal_probs.sort(key=lambda mp: mp[1], reverse=True)
+        print("Top policy moves:")
+        for move, prob in legal_probs[:10]:
+            print(f"  {move} {prob:.4f}")
 
     def _select_child(self, node):
         """使用PUCT算法选择最优子节点"""

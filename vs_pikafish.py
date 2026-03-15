@@ -142,7 +142,7 @@ def play_one_game(
         if is_ai_turn:
             # AI 通过 MCTS 选择走法
             actions, probs = ai_agent.get_action_probs(
-                game, temperature=0.0, add_noise=False
+                game, mode="eval"
             )
             if not actions:
                 logger.warning("AI 无合法走法，局面：%s", game.get_fen())
@@ -207,9 +207,10 @@ class _MCTSAgentAdapter:
     def new_game(self) -> None:
         self._mcts.root = MCTSNode()
 
-    def get_action_probs(self, game, temperature=0.0, add_noise=False):
+    def get_action_probs(self, game, temperature=0.0, add_noise=False,
+                         mode=None):
         return self._mcts.get_action_probs(
-            game, temperature=temperature, add_noise=add_noise
+            game, temperature=temperature, add_noise=add_noise, mode=mode
         )
 
 
@@ -267,6 +268,10 @@ def main() -> None:
         "--verbose", action="store_true",
         help="打印每步走法和棋盘"
     )
+    parser.add_argument(
+        "--debug_mcts", action="store_true",
+        help="打印 MCTS 调试信息（网络输出、根节点统计等）"
+    )
 
     args = parser.parse_args()
 
@@ -312,7 +317,8 @@ def main() -> None:
               file=sys.stderr)
         model.build()
 
-    mcts = MCTS(model, num_simulations=args.num_simulations)
+    mcts = MCTS(model, num_simulations=args.num_simulations,
+                debug_mcts=args.debug_mcts)
     ai_agent = _MCTSAgentAdapter(mcts)
 
     # 统计
