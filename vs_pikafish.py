@@ -33,6 +33,9 @@ import os
 import sys
 from typing import Optional
 
+import numpy as np
+
+from .game import flip_move
 from .pikafish_agent import PikafishAgent
 from .mcts import MCTSNode
 
@@ -144,7 +147,11 @@ def play_one_game(
             if not actions:
                 logger.warning("AI 无合法走法，局面：%s", game.get_fen())
                 break
-            move = actions[0]  # temperature=0 时为最高访问次数的走法
+            # 选择访问次数最多的走法（probs[best_idx]=1.0，其余为0）
+            best_idx = int(np.argmax(probs))
+            move_mcts = actions[best_idx]  # MCTS 内部视角（始终为红方坐标）
+            # 转换为实际棋盘坐标（黑方走子时需翻转）
+            move = move_mcts if game.red_to_move else flip_move(move_mcts)
         else:
             # 引擎走法（PikafishAgent.get_move 返回内部格式）
             move = engine_agent.get_move(game)
