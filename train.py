@@ -42,6 +42,80 @@ DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(__file__), 'saved_model')
 DEFAULT_MODEL_PATH = os.path.join(DEFAULT_MODEL_DIR, 'model.pth')
 
 
+# ---------------------------------------------------------------------------
+# 和棋过滤辅助工具
+# ---------------------------------------------------------------------------
+
+def classify_draw(terminate_reason, num_moves, max_moves):
+    """将一局和棋按终止原因分为三类：maxmoves / repetition / other。
+
+    Args:
+        terminate_reason: game.terminate_reason 字符串（可能为 None）。
+        num_moves:        实际步数（int）。
+        max_moves:        训练时设置的最大步数上限（int）。
+
+    Returns:
+        str: ``'maxmoves'``、``'repetition'`` 或 ``'other'``。
+    """
+    # repetition 类：重复局面 / 长将 / 长捉
+    if terminate_reason in ('repetition', 'perpetual_check', 'perpetual_chase'):
+        return 'repetition'
+    # max-moves 类：显式达到步数上限，或无终止原因但步数到上限
+    if terminate_reason is None or terminate_reason in ('-', 'max_moves', 'move_limit'):
+        if num_moves >= max_moves:
+            return 'maxmoves'
+    # 其他（stalemate 等）
+    return 'other'
+
+
+class DrawFilter:
+    """按概率决定是否保留一局和棋的训练数据。
+
+    对于非和棋（win/loss）的对局，``should_keep`` 始终返回 True。
+    对于和棋对局，根据 draw_category 和对应概率进行随机抽样。
+
+    抽样使用独立的 ``random.Random`` 实例，以确保可复现且不影响其他
+    随机数流（如 MCTS 噪声）。
+    """
+
+    def __init__(self,
+                 keep_draw_maxmoves_prob=0.25,
+                 keep_draw_other_prob=0.10,
+                 keep_draw_repetition_prob=0.05,
+                 seed=0):
+        self._rng = random.Random(seed)
+        self._probs = {
+            'maxmoves': keep_draw_maxmoves_prob,
+            'repetition': keep_draw_repetition_prob,
+            'other': keep_draw_other_prob,
+        }
+        # 统计信息
+        self.counts = {k: 0 for k in self._probs}
+        self.kept = {k: 0 for k in self._probs}
+
+    def should_keep(self, draw_category):
+        """返回 True 时保留该和棋对局的训练数据。"""
+        # 将未知类别归入 other
+        if draw_category not in self._probs:
+            draw_category = 'other'
+        prob = self._probs[draw_category]
+        self.counts[draw_category] += 1
+        keep = self._rng.random() < prob
+        if keep:
+            self.kept[draw_category] += 1
+        return keep
+
+    def summary_str(self):
+        """返回当前统计信息的单行字符串，用于日志输出。"""
+        parts = []
+        for cat in ('maxmoves', 'repetition', 'other'):
+            total = self.counts.get(cat, 0)
+            k = self.kept.get(cat, 0)
+            pct = f'{k/total*100:.0f}%' if total > 0 else '-'
+            parts.append(f'{cat}: {k}/{total}({pct})')
+        return '  '.join(parts)
+
+
 def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=200):
     """
     通过对局评测两个模型，返回 model_a 的 score（draw=0.5 计分）。
@@ -396,7 +470,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  engine_options=None,
                  # 阶段 B：从蒸馏模型启动 / 放宽重复判和
                  init_from_distill=None,
-                 repetition_draw_threshold=3):
+                 repetition_draw_threshold=3,
+                 # 和棋过滤参数
+                 keep_draw_maxmoves_prob=0.25,
+                 keep_draw_other_prob=0.10,
+                 keep_draw_repetition_prob=0.05,
+                 draw_filter_seed=0):
     """
     运行完整的训练流程
 
@@ -431,6 +510,11 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                            启动阶段 B RL 微调。
         repetition_draw_threshold: 重复局面判和阈值（>= 3）；训练时可调大（如 5 或 6）
                                    以减少短局重复判和，获得更丰富的训练信号（默认 3）。
+        keep_draw_maxmoves_prob: 达到步数上限的和棋保留概率（默认 0.25）。
+        keep_draw_other_prob: 其他原因和棋（stalemate 等）保留概率（默认 0.10）。
+        keep_draw_repetition_prob: 重复局面和棋（repetition/perpetual_check/perpetual_chase）
+                                   保留概率（默认 0.05）。
+        draw_filter_seed: 和棋过滤随机数种子，用于可复现抽样（默认 0）。
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
@@ -481,10 +565,22 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         eval_gate=eval_gate,
         init_from_distill=init_from_distill,
         repetition_draw_threshold=repetition_draw_threshold,
+        keep_draw_maxmoves_prob=keep_draw_maxmoves_prob,
+        keep_draw_other_prob=keep_draw_other_prob,
+        keep_draw_repetition_prob=keep_draw_repetition_prob,
+        draw_filter_seed=draw_filter_seed,
     )
     run_dir = init_run_dir(config=training_config)
     print(f"日志目录: {run_dir}")
     print(f"重复判和阈值: {repetition_draw_threshold}")
+
+    # 初始化和棋过滤器
+    draw_filter = DrawFilter(
+        keep_draw_maxmoves_prob=keep_draw_maxmoves_prob,
+        keep_draw_other_prob=keep_draw_other_prob,
+        keep_draw_repetition_prob=keep_draw_repetition_prob,
+        seed=draw_filter_seed,
+    )
 
     # 初始化评测状态（含 ELO）
     eval_state = load_evaluation_state(run_dir)
@@ -563,7 +659,18 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 engine_movetime_log = None
                 my_side_log = 'both'
 
-            data_buffer.extend(data)
+            # 和棋过滤：win/loss 全部保留，draw 按概率过滤
+            # winner 为 'draw' 或 None（无合法走法提前终止）时均视为和棋
+            is_draw = (winner == 'draw' or winner is None)
+            if is_draw:
+                draw_category = classify_draw(terminate_reason_log, moves, max_moves)
+                kept_for_training = draw_filter.should_keep(draw_category)
+            else:
+                draw_category = None
+                kept_for_training = True
+
+            if kept_for_training:
+                data_buffer.extend(data)
 
             if winner == 'red':
                 stats['red_wins'] += 1
@@ -573,11 +680,17 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 stats['draws'] += 1
 
             elapsed = time.time() - start_time
+            filter_info = (
+                f', draw_cat={draw_category}, kept={kept_for_training}'
+                if is_draw else ''
+            )
             print(f"[第 {game_idx}/{num_games} 局] "
                   f"对手: {opp_type_log}, "
+                  f"我方: {my_side_log}, "
                   f"胜方: {winner or '和棋'}, "
                   f"步数: {moves}, "
-                  f"原因: {terminate_reason_log or '-'}, "
+                  f"原因: {terminate_reason_log or '-'}"
+                  f"{filter_info}, "
                   f"缓冲区: {len(data_buffer)}, "
                   f"耗时: {elapsed:.1f}s")
 
@@ -593,8 +706,18 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 'opponent_strength': opp_strength_log,
                 'my_side': my_side_log,
                 'engine_movetime': engine_movetime_log,
+                'draw_category': draw_category,
+                'kept_for_training': kept_for_training,
             }
             append_self_play_jsonl(run_dir, jsonl_record)
+
+            # 每 50 局输出一次和棋过滤汇总
+            if game_idx % 50 == 0:
+                total_draws = sum(draw_filter.counts.values())
+                total_kept = sum(draw_filter.kept.values())
+                print(f"  [和棋过滤汇总 @{game_idx}局] "
+                      f"draw总数={total_draws}, 进入buffer={total_kept} | "
+                      f"{draw_filter.summary_str()}")
 
             avg_loss = 0.0
             if len(data_buffer) >= batch_size:
@@ -689,6 +812,10 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     print(f"红方胜: {stats['red_wins']}, "
           f"黑方胜: {stats['black_wins']}, "
           f"和棋: {stats['draws']}")
+    total_draws_final = sum(draw_filter.counts.values())
+    total_kept_final = sum(draw_filter.kept.values())
+    print(f"和棋过滤汇总: draw总数={total_draws_final}, "
+          f"进入buffer={total_kept_final} | {draw_filter.summary_str()}")
     print(f"模型已保存到: {model_path}")
     print(f"日志目录: {run_dir}")
     print(f"{'='*60}")
@@ -746,6 +873,15 @@ def main():
     parser.add_argument('--repetition_draw_threshold', type=int, default=3,
                         help='重复局面判和阈值（>= 3）；训练时可调大（如 5 或 6）'
                              '以减少短局重复判和，获得更丰富的训练信号 (默认: 3)')
+    # 和棋过滤参数
+    parser.add_argument('--keep_draw_maxmoves_prob', type=float, default=0.25,
+                        help='达到步数上限的和棋保留概率 (默认: 0.25)')
+    parser.add_argument('--keep_draw_other_prob', type=float, default=0.10,
+                        help='其他原因和棋（stalemate 等）保留概率 (默认: 0.10)')
+    parser.add_argument('--keep_draw_repetition_prob', type=float, default=0.05,
+                        help='重复局面和棋（repetition/perpetual_check 等）保留概率 (默认: 0.05)')
+    parser.add_argument('--draw_filter_seed', type=int, default=0,
+                        help='和棋过滤随机数种子，用于可复现抽样 (默认: 0)')
 
     args = parser.parse_args()
     run_training(**vars(args))
