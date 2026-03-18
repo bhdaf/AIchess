@@ -240,6 +240,16 @@ def main() -> None:
         help="引擎每步思考时间（毫秒）"
     )
     parser.add_argument(
+        "--elo", type=int, default=None,
+        help="引擎目标 Elo（如 1500）；设置后以 UCI_LimitStrength + UCI_Elo 控制强度，"
+             "优先于 --skill_level。movetime 仍用作搜索时间上限"
+    )
+    parser.add_argument(
+        "--skill_level", type=int, default=None,
+        metavar="0-20",
+        help="引擎技能等级（0-20）；仅在未设置 --elo 时生效"
+    )
+    parser.add_argument(
         "--ai_side", choices=["red", "black", "both"], default="both",
         help="AI 执哪方：red/black/both（both 时交替执红黑）"
     )
@@ -334,6 +344,8 @@ def main() -> None:
         with PikafishAgent(
             args.engine_path,
             movetime_ms=args.movetime,
+            elo=args.elo,
+            skill_level=args.skill_level,
             options=engine_options,
         ) as engine_agent:
 

@@ -916,6 +916,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  pikafish_movetime_weak=30,
                  pikafish_movetime_mid=60,
                  pikafish_movetime_full=100,
+                 pikafish_elo_weak=None,
+                 pikafish_elo_mid=None,
+                 pikafish_elo_full=None,
                  curriculum='default',
                  my_side='alternate',
                  eval_gate=0.55,
@@ -960,6 +963,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         pikafish_movetime_weak: 弱强度引擎思考时间（ms）
         pikafish_movetime_mid: 中强度引擎思考时间（ms）
         pikafish_movetime_full: 全强度引擎思考时间（ms）
+        pikafish_elo_weak: 弱强度引擎目标 Elo；设置后以 UCI_Elo 控制强度，movetime 仍用作搜索时间上限
+        pikafish_elo_mid: 中强度引擎目标 Elo
+        pikafish_elo_full: 全强度引擎目标 Elo
         curriculum: 课程学习策略（'default' 或 None/纯自对弈）
         my_side: 我方执哪方（'red'/'black'/'alternate'，仅对手池模式有效）
         eval_gate: 评测得分门控阈值（仅 eval_opponent='previous' 时生效，
@@ -1031,6 +1037,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         pikafish_movetime_weak=pikafish_movetime_weak,
         pikafish_movetime_mid=pikafish_movetime_mid,
         pikafish_movetime_full=pikafish_movetime_full,
+        pikafish_elo_weak=pikafish_elo_weak,
+        pikafish_elo_mid=pikafish_elo_mid,
+        pikafish_elo_full=pikafish_elo_full,
         curriculum=curriculum,
         my_side=my_side,
         eval_gate=eval_gate,
@@ -1078,6 +1087,9 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
             pikafish_movetime_weak=pikafish_movetime_weak,
             pikafish_movetime_mid=pikafish_movetime_mid,
             pikafish_movetime_full=pikafish_movetime_full,
+            pikafish_elo_weak=pikafish_elo_weak,
+            pikafish_elo_mid=pikafish_elo_mid,
+            pikafish_elo_full=pikafish_elo_full,
             num_simulations=num_simulations,
             checkpoints_dir=checkpoints_dir,
             curriculum=curriculum,
@@ -1403,6 +1415,13 @@ def main():
                         help='中强度引擎思考时间 ms (默认: 60)')
     parser.add_argument('--pikafish_movetime_full', type=int, default=100,
                         help='全强度引擎思考时间 ms (默认: 100)')
+    parser.add_argument('--pikafish_elo_weak', type=int, default=None,
+                        help='弱强度引擎目标 Elo（如 1000）；设置后以 UCI_Elo 控制引擎强度，'
+                             'movetime 仍作为搜索时间上限（不再通过 movetime 控制强度）')
+    parser.add_argument('--pikafish_elo_mid', type=int, default=None,
+                        help='中强度引擎目标 Elo（如 1500）')
+    parser.add_argument('--pikafish_elo_full', type=int, default=None,
+                        help='全强度引擎目标 Elo（如 2000）')
     parser.add_argument('--curriculum', type=str, default='default',
                         help="课程学习策略：'default' 或 'none'（全自对弈，默认: default）")
     parser.add_argument('--my_side', type=str, default='alternate',

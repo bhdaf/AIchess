@@ -14,7 +14,7 @@ Pikafish/UCI 引擎 Agent 封装
 
 示例::
 
-    agent = PikafishAgent("/path/to/pikafish", movetime_ms=100)
+    agent = PikafishAgent("/path/to/pikafish", elo=1500)
     agent.start()
     agent.new_game()
     move = agent.get_move(game)   # 返回内部格式走法，如 "7072"
@@ -22,7 +22,7 @@ Pikafish/UCI 引擎 Agent 封装
 
 或作为上下文管理器::
 
-    with PikafishAgent("/path/to/pikafish") as agent:
+    with PikafishAgent("/path/to/pikafish", elo=1500) as agent:
         agent.new_game()
         move = agent.get_move(game)
 """
@@ -230,18 +230,31 @@ class PikafishAgent(BaseAgent):
         engine_path (str): 引擎可执行文件路径（如 ``"/usr/local/bin/pikafish"``）。
         movetime_ms (int): 每步思考时间（毫秒），默认 100 ms。
         depth (int | None): 固定深度搜索；若指定则忽略 ``movetime_ms``。
+        elo (int | None): 目标 Elo 评分（如 ``1500``）；设置后自动启用
+            ``UCI_LimitStrength=true`` 和 ``UCI_Elo=<elo>``，以 Elo 而非
+            movetime 控制引擎强度。同时设置 ``elo`` 和 ``skill_level`` 时，
+            ``elo`` 生效而 ``skill_level`` 被忽略。
+        skill_level (int | None): 引擎技能等级（0‑20）；设置后发送
+            ``Skill Level=<skill_level>``。仅在 ``elo`` 未指定时生效。
         options (dict | None): 在握手后通过 ``setoption`` 发送给引擎的选项字典，
-            例如 ``{"UCI_Elo": "1500", "Skill Level": "5"}``。
+            例如 ``{"Hash": "256"}``。该字典中的选项优先级高于 ``elo``/
+            ``skill_level`` 自动应用的选项，可用于覆盖默认行为。
         init_timeout (float): UCI 握手超时秒数。
         move_timeout (float): 等待 bestmove 的额外超时秒数。
 
     Example::
 
-        with PikafishAgent("/path/to/pikafish", movetime_ms=50) as agent:
+        # 使用 Elo 控制强度（推荐）
+        with PikafishAgent("/path/to/pikafish", elo=1500) as agent:
             game = ChessGame().reset()
             agent.new_game()
             move = agent.get_move(game)   # "7072"
             game.step(move)
+
+        # 兼容旧方式：通过 movetime 控制
+        with PikafishAgent("/path/to/pikafish", movetime_ms=50) as agent:
+            agent.new_game()
+            move = agent.get_move(game)
     """
 
     def __init__(
@@ -249,6 +262,8 @@ class PikafishAgent(BaseAgent):
         engine_path: str,
         movetime_ms: int = 100,
         depth: Optional[int] = None,
+        elo: Optional[int] = None,
+        skill_level: Optional[int] = None,
         options: Optional[dict] = None,
         init_timeout: float = 10.0,
         move_timeout: float = 5.0,
@@ -259,6 +274,8 @@ class PikafishAgent(BaseAgent):
         self.engine_path = engine_path
         self.movetime_ms = movetime_ms
         self.depth = depth
+        self.elo = elo
+        self.skill_level = skill_level
         self.options = options or {}
         self.multipv = max(1, int(multipv))
         self._engine = UCIEngine(
@@ -274,6 +291,17 @@ class PikafishAgent(BaseAgent):
     def start(self) -> None:
         """启动引擎并应用 setoption 配置。"""
         self._engine.start()
+        # 先应用 Elo/Skill Level 强度设置（用户 options 可覆盖）
+        if self.elo is not None:
+            # 启用 UCI 强度限制并设置目标 Elo
+            self._engine.set_option("UCI_LimitStrength", "true")
+            self._engine.set_option("UCI_Elo", str(self.elo))
+            logger.debug("Pikafish 强度控制：UCI_Elo=%d", self.elo)
+        elif self.skill_level is not None:
+            # Skill Level 控制（0-20），不启用 UCI_LimitStrength
+            self._engine.set_option("Skill Level", str(self.skill_level))
+            logger.debug("Pikafish 强度控制：Skill Level=%d", self.skill_level)
+        # 用户自定义选项（优先级最高，可覆盖上述设置）
         for name, value in self.options.items():
             self._engine.set_option(name, str(value))
         if self.multipv > 1:
