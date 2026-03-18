@@ -169,23 +169,26 @@ def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=
 
 
 def self_play_game(model, num_simulations=100, max_moves=200, temperature_threshold=30,
-                   repetition_draw_threshold=3):
+                   repetition_draw_threshold=3, mcts_cache_size=0):
     """
     执行一局自对弈
 
     Args:
-        model: ChessModel实例
+        model: ChessModel 实例，或实现了 ``predict_with_mask(planes, legal_indices)``
+               接口的对象（如 :class:`~AIchess.inference_server.RemoteEvaluator`）
         num_simulations: MCTS模拟次数
         max_moves: 最大步数（超过判和）
         temperature_threshold: 前N步使用温度1.0探索
         repetition_draw_threshold: 重复局面判和阈值（传递给 ChessGame，默认 3）
+        mcts_cache_size: MCTS 局面评估缓存大小（0=禁用；>0 可减少重复推理，
+                         与 RemoteEvaluator 搭配使用时可降低 IPC 开销）
 
     Returns:
         training_data: [(state_planes, policy_target, value_target), ...]
     """
     game = ChessGame(repetition_draw_threshold=repetition_draw_threshold)
     game.reset()
-    mcts = MCTS(model, num_simulations=num_simulations)
+    mcts = MCTS(model, num_simulations=num_simulations, cache_size=mcts_cache_size)
 
     states = []
     policies = []
@@ -366,6 +369,455 @@ def play_game_vs_opponent_collect_my_turn(
     return training_data, winner_raw, move_count, metadata
 
 
+# ---------------------------------------------------------------------------
+# 多进程自对弈 Worker 进程函数
+# ---------------------------------------------------------------------------
+
+def self_play_worker(
+    worker_id,
+    request_queue,
+    response_queue,
+    data_queue,
+    shutdown_event,
+    num_simulations=100,
+    max_moves=200,
+    temperature_threshold=30,
+    repetition_draw_threshold=3,
+    mcts_cache_size=0,
+    seed=None,
+):
+    """
+    自对弈 worker 进程入口函数（在独立子进程中运行）。
+
+    使用 :class:`~AIchess.inference_server.RemoteEvaluator` 与推理服务通信，
+    本进程**不**持有任何 GPU 资源，只负责运行 MCTS 搜索逻辑与棋局管理。
+
+    Args:
+        worker_id:               本 worker 的编号（与 response_queue 对应）
+        request_queue:           所有 worker 共用的推理请求队列
+        response_queue:          本 worker 专属的推理响应队列
+        data_queue:              向主进程发送自对弈结果的队列
+        shutdown_event:          主进程设置此事件时 worker 优雅退出
+        num_simulations:         每步 MCTS 模拟次数
+        max_moves:               每局最大步数
+        temperature_threshold:   前 N 步使用温度 1.0 探索
+        repetition_draw_threshold: 重复局面判和阈值
+        mcts_cache_size:         MCTS 局面缓存大小（0=禁用）
+        seed:                    基础随机数种子（每个 worker 加上自身 id）
+    """
+    import logging as _logging
+    # Spawn context creates fresh processes; configure logging only if not yet configured.
+    root_logger = _logging.getLogger()
+    if not root_logger.handlers:
+        _logging.basicConfig(
+            level=_logging.INFO,
+            format=f"%(asctime)s [Worker-{worker_id}] %(levelname)s %(message)s",
+        )
+    _logger = _logging.getLogger(__name__)
+
+    # 设置可复现种子（每个 worker 独立）
+    if seed is not None:
+        import random as _random
+        _random.seed(seed + worker_id)
+        np.random.seed((seed + worker_id) & 0xFFFFFFFF)
+
+    from .inference_server import RemoteEvaluator, InferenceServerShutdownError
+    evaluator = RemoteEvaluator(worker_id, request_queue, response_queue)
+
+    games_played = 0
+    t_start = time.time()
+
+    while not shutdown_event.is_set():
+        try:
+            training_data, winner, move_count, terminate_reason = self_play_game(
+                evaluator,
+                num_simulations=num_simulations,
+                max_moves=max_moves,
+                temperature_threshold=temperature_threshold,
+                repetition_draw_threshold=repetition_draw_threshold,
+                mcts_cache_size=mcts_cache_size,
+            )
+        except InferenceServerShutdownError:
+            _logger.info("推理服务已关闭，worker 退出")
+            break
+        except RuntimeError as exc:
+            _logger.error("Worker 运行时错误: %s", exc)
+            break
+        except Exception as exc:
+            import traceback
+            _logger.error("Worker 未预期错误: %s\n%s", exc, traceback.format_exc())
+            break
+
+        games_played += 1
+
+        try:
+            data_queue.put(
+                {
+                    "type": "game_data",
+                    "worker_id": worker_id,
+                    "training_data": training_data,
+                    "winner": winner,
+                    "move_count": move_count,
+                    "terminate_reason": terminate_reason,
+                },
+                timeout=60.0,
+            )
+        except Exception as exc:
+            _logger.warning("无法发送游戏数据到主进程: %s", exc)
+
+        # 每 5 局打印一次吞吐量日志
+        if games_played % 5 == 0:
+            elapsed = time.time() - t_start
+            _logger.info(
+                "已完成 %d 局，速率 %.2f 局/s",
+                games_played, games_played / max(elapsed, 1e-6),
+            )
+
+    # 通知主进程本 worker 已完成
+    try:
+        data_queue.put(
+            {"type": "worker_done", "worker_id": worker_id, "games_played": games_played},
+            timeout=5.0,
+        )
+    except Exception:
+        pass
+
+    _logger.info("Worker %d 已退出，共完成 %d 局", worker_id, games_played)
+
+
+# ---------------------------------------------------------------------------
+# 并行自对弈训练循环
+# ---------------------------------------------------------------------------
+
+def _run_parallel_training(
+    model,
+    model_path,
+    num_games,
+    num_simulations,
+    num_epochs,
+    batch_size,
+    lr,
+    max_moves,
+    buffer_size,
+    save_interval,
+    run_dir,
+    data_buffer,
+    stats,
+    draw_filter,
+    eval_state,
+    baseline_path,
+    pool,
+    eval_interval,
+    eval_games,
+    eval_simulations,
+    eval_opponent,
+    elo_k,
+    eval_gate,
+    repetition_draw_threshold,
+    num_selfplay_workers,
+    inference_batch_size_max,
+    inference_flush_ms,
+    inference_precision,
+    use_tf32,
+    mcts_cache_size,
+    worker_seed,
+):
+    """
+    并行自对弈训练主循环（生产者-消费者流水线）。
+
+    * N 个 worker 进程持续生成自对弈数据并写入 data_queue。
+    * 1 个推理服务进程独占 GPU，为 worker 提供批量推理。
+    * 主进程从 data_queue 收集数据，写入 ReplayBuffer，触发训练，
+      并在每次保存 checkpoint 后通知推理服务重新加载最新权重。
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+
+    # 队列大小上限（避免内存爆炸）
+    _REQ_MAXSIZE  = 512
+    _RESP_MAXSIZE = 256
+    _DATA_MAXSIZE = 200
+
+    request_queue    = ctx.Queue(maxsize=_REQ_MAXSIZE)
+    response_queues  = [ctx.Queue(maxsize=_RESP_MAXSIZE) for _ in range(num_selfplay_workers)]
+    data_queue       = ctx.Queue(maxsize=_DATA_MAXSIZE)
+    shutdown_event   = ctx.Event()
+    model_update_q   = ctx.Queue(maxsize=4)
+
+    # ── 启动推理服务进程 ──────────────────────────────────────────────────────
+    from .inference_server import (
+        run_inference_server,
+        RELOAD_MODEL_MSG,
+        SHUTDOWN_MSG as _INF_SHUTDOWN,
+    )
+    server_proc = ctx.Process(
+        target=run_inference_server,
+        args=(
+            model_path,
+            request_queue,
+            response_queues,
+            shutdown_event,
+            model_update_q,
+        ),
+        kwargs=dict(
+            batch_size_max=inference_batch_size_max,
+            flush_ms=inference_flush_ms,
+            precision=inference_precision,
+            use_tf32=use_tf32,
+        ),
+        daemon=True,
+        name="InferenceServer",
+    )
+    server_proc.start()
+    print(f"[并行模式] 推理服务进程已启动 (PID={server_proc.pid})")
+
+    # ── 启动 worker 进程 ──────────────────────────────────────────────────────
+    worker_procs = []
+    for wid in range(num_selfplay_workers):
+        wp = ctx.Process(
+            target=self_play_worker,
+            args=(
+                wid,
+                request_queue,
+                response_queues[wid],
+                data_queue,
+                shutdown_event,
+            ),
+            kwargs=dict(
+                num_simulations=num_simulations,
+                max_moves=max_moves,
+                temperature_threshold=30,
+                repetition_draw_threshold=repetition_draw_threshold,
+                mcts_cache_size=mcts_cache_size,
+                seed=worker_seed,
+            ),
+            daemon=True,
+            name=f"SelfPlayWorker-{wid}",
+        )
+        wp.start()
+        worker_procs.append(wp)
+    print(f"[并行模式] {num_selfplay_workers} 个 self-play worker 已启动")
+
+    # ── 主循环：收集数据 + 训练 ──────────────────────────────────────────────
+    games_collected = 0
+    workers_done = 0
+    t_loop_start = time.time()
+    games_per_s_window_start = time.time()
+    games_per_s_window_count = 0
+
+    try:
+        while games_collected < num_games:
+            # 从 data_queue 取一局结果（超时后继续检查 shutdown）
+            try:
+                item = data_queue.get(timeout=2.0)
+            except Exception:
+                # 检查所有 worker 是否已退出
+                if all(not wp.is_alive() for wp in worker_procs):
+                    print("[并行模式] 所有 worker 进程已退出，停止收集")
+                    break
+                continue
+
+            if item.get("type") == "worker_done":
+                workers_done += 1
+                print(f"  [并行模式] Worker {item['worker_id']} 结束，"
+                      f"共 {item['games_played']} 局")
+                if workers_done >= num_selfplay_workers:
+                    break
+                continue
+
+            if item.get("type") != "game_data":
+                continue
+
+            # ── 处理一局游戏数据 ─────────────────────────────────────────────
+            games_collected += 1
+            games_per_s_window_count += 1
+            data    = item["training_data"]
+            winner  = item["winner"]
+            moves   = item["move_count"]
+            reason  = item["terminate_reason"]
+            wid     = item["worker_id"]
+
+            is_draw = (winner == "draw" or winner is None)
+            kept_for_training = True
+            draw_category = None
+            if is_draw:
+                draw_category = classify_draw(reason, moves, max_moves)
+                kept_for_training = draw_filter.should_keep(draw_category)
+
+            if kept_for_training:
+                data_buffer.extend(data)
+
+            if winner == "red":
+                stats["red_wins"] += 1
+            elif winner == "black":
+                stats["black_wins"] += 1
+            else:
+                stats["draws"] += 1
+
+            # 局/秒统计（每 20 局）
+            now = time.time()
+            if games_per_s_window_count >= 20:
+                elapsed_w = now - games_per_s_window_start
+                gps = games_per_s_window_count / max(elapsed_w, 1e-6)
+                print(f"  [并行模式] 吞吐：{gps:.2f} 局/s (最近 {games_per_s_window_count} 局)")
+                games_per_s_window_start = now
+                games_per_s_window_count = 0
+
+            filter_info = (
+                f", draw_cat={draw_category}, kept={kept_for_training}" if is_draw else ""
+            )
+            print(
+                f"[第 {games_collected}/{num_games} 局] "
+                f"worker={wid}, 胜方={winner or '和棋'}, 步数={moves}, "
+                f"原因={reason or '-'}{filter_info}, "
+                f"缓冲区={len(data_buffer)}"
+            )
+
+            jsonl_record = {
+                "game_idx": games_collected,
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "winner": winner or "draw",
+                "terminate_reason": reason,
+                "num_moves": moves,
+                "num_samples": len(data),
+                "elapsed_s": round(time.time() - t_loop_start, 2),
+                "opponent_type": "self_play_parallel",
+                "opponent_strength": "current",
+                "my_side": "both",
+                "engine_movetime": None,
+                "draw_category": draw_category,
+                "kept_for_training": kept_for_training,
+            }
+            append_self_play_jsonl(run_dir, jsonl_record)
+
+            # 每 50 局输出和棋过滤汇总
+            if games_collected % 50 == 0:
+                total_draws = sum(draw_filter.counts.values())
+                total_kept  = sum(draw_filter.kept.values())
+                print(
+                    f"  [和棋过滤汇总 @{games_collected}局] "
+                    f"draw总数={total_draws}, 进入buffer={total_kept} | "
+                    f"{draw_filter.summary_str()}"
+                )
+
+            # ── 训练 ─────────────────────────────────────────────────────────
+            avg_loss = 0.0
+            if len(data_buffer) >= batch_size:
+                train_data = list(data_buffer)
+                avg_loss = train_model(
+                    model, train_data, batch_size=batch_size,
+                    epochs=num_epochs, lr=lr,
+                )
+                print(f"  训练完成，平均损失: {avg_loss:.4f}")
+
+                append_training_csv(run_dir, {
+                    "game_idx": games_collected,
+                    "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "loss": round(avg_loss, 6),
+                    "buffer_size": len(data_buffer),
+                    "elapsed_s": round(time.time() - t_loop_start, 2),
+                })
+
+            # ── 定期保存 + 通知推理服务重载 ──────────────────────────────────
+            if games_collected % save_interval == 0:
+                model.save(model_path)
+                print(f"  模型已保存到: {model_path}")
+                try:
+                    model_update_q.put_nowait(RELOAD_MODEL_MSG)
+                except Exception:
+                    pass
+
+            # ── 定期评测 ─────────────────────────────────────────────────────
+            if eval_interval > 0 and games_collected % eval_interval == 0:
+                _do_eval(
+                    model, model_path, baseline_path, run_dir,
+                    eval_opponent, eval_games, eval_simulations,
+                    max_moves, elo_k, eval_gate, eval_state,
+                    game_idx=games_collected,
+                )
+
+    finally:
+        # ── 优雅关闭 ─────────────────────────────────────────────────────────
+        shutdown_event.set()
+        # 通知服务进程关闭
+        try:
+            model_update_q.put(_INF_SHUTDOWN, timeout=2.0)
+        except Exception:
+            pass
+        # 等待子进程退出（最多 15 秒）
+        for wp in worker_procs:
+            wp.join(timeout=15)
+            if wp.is_alive():
+                wp.terminate()
+        server_proc.join(timeout=15)
+        if server_proc.is_alive():
+            server_proc.terminate()
+        print("[并行模式] 所有子进程已退出")
+
+
+def _do_eval(
+    model, model_path, baseline_path, run_dir,
+    eval_opponent, eval_games, eval_simulations,
+    max_moves, elo_k, eval_gate, eval_state,
+    game_idx,
+):
+    """执行一次模型评测并更新 ELO 状态（供主循环复用）。"""
+    print(f"  [评测] 第 {game_idx} 局，开始评测...")
+    if eval_opponent == "self":
+        opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+        opponent_model.build()
+        opponent_label = "self"
+    else:
+        opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+        if os.path.exists(baseline_path):
+            opponent_model.load(baseline_path)
+        else:
+            opponent_model.build()
+        opponent_label = "previous"
+
+    score, wins, losses, draws_eval = evaluate_models(
+        model, opponent_model,
+        n_games=eval_games,
+        num_simulations=eval_simulations,
+        max_moves=max_moves,
+    )
+
+    elo_cur = eval_state.get("elo_current", 1500.0)
+    elo_opp = eval_state.get("elo_opponent", 1500.0)
+    new_elo, elo_delta = compute_elo_update(elo_cur, elo_opp, score, k=elo_k)
+    eval_state["elo_current"] = new_elo
+    eval_state["last_game_idx"] = game_idx
+    eval_state["last_opponent"] = opponent_label
+    save_evaluation_state(run_dir, eval_state)
+
+    print(
+        f"  [评测] 胜: {wins}, 负: {losses}, 和: {draws_eval}, "
+        f"score: {score:.3f}, ELO: {new_elo:.1f} (Δ{elo_delta:+.1f})"
+    )
+
+    append_evaluation_csv(run_dir, {
+        "game_idx": game_idx,
+        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+        "opponent": opponent_label,
+        "eval_games": eval_games,
+        "eval_sims": eval_simulations,
+        "wins": wins,
+        "losses": losses,
+        "draws": draws_eval,
+        "score": round(score, 6),
+        "elo": round(new_elo, 2),
+        "elo_delta": round(elo_delta, 2),
+    })
+
+    if eval_opponent == "previous":
+        if score >= eval_gate:
+            model.save(baseline_path)
+            print(f"  [评测] score {score:.3f} >= gate {eval_gate}，基准模型已更新")
+        else:
+            print(f"  [评测] score {score:.3f} < gate {eval_gate}，保持基准模型不变")
+
+
 def train_model(model, training_data, batch_size=256, epochs=5, lr=0.001):
     """
     用训练数据训练模型
@@ -475,7 +927,16 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  keep_draw_maxmoves_prob=0.25,
                  keep_draw_other_prob=0.10,
                  keep_draw_repetition_prob=0.05,
-                 draw_filter_seed=0):
+                 draw_filter_seed=0,
+                 # ── 并行自对弈 + GPU batch inference ────────────────────────
+                 num_selfplay_workers=0,
+                 inference_batch_size_max=64,
+                 inference_flush_ms=5.0,
+                 inference_precision='bf16',
+                 use_tf32=False,
+                 mcts_cache_size=0,
+                 worker_seed=42,
+                 device='cuda'):
     """
     运行完整的训练流程
 
@@ -515,6 +976,16 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         keep_draw_repetition_prob: 重复局面和棋（repetition/perpetual_check/perpetual_chase）
                                    保留概率（默认 0.05）。
         draw_filter_seed: 和棋过滤随机数种子，用于可复现抽样（默认 0）。
+        num_selfplay_workers: 并行 self-play worker 进程数（>0 时启用并行模式；
+                              默认 0 = 使用原有单进程模式）。
+                              推荐：Linux + RTX 4070 下设置 6~8。
+        inference_batch_size_max: 推理服务最大 batch 大小（默认 64）。
+        inference_flush_ms: 推理服务 flush 超时（毫秒，默认 5.0）。
+        inference_precision: 推理精度：'bf16'（推荐）/ 'fp16' / 'fp32'（默认 'bf16'）。
+        use_tf32: 是否为 matmul/cudnn 启用 TF32（默认 False）。
+        mcts_cache_size: MCTS 局面评估缓存大小（默认 0=禁用）。
+        worker_seed: worker 进程随机数基础种子（默认 42；每个 worker 加上自身 id）。
+        device: 计算设备（'cuda' / 'cpu'）；'cpu' 时强制走单进程原逻辑。
     """
     if model_path is None:
         model_path = DEFAULT_MODEL_PATH
@@ -569,6 +1040,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
         keep_draw_other_prob=keep_draw_other_prob,
         keep_draw_repetition_prob=keep_draw_repetition_prob,
         draw_filter_seed=draw_filter_seed,
+        num_selfplay_workers=num_selfplay_workers,
+        inference_batch_size_max=inference_batch_size_max,
+        inference_flush_ms=inference_flush_ms,
+        inference_precision=inference_precision,
+        use_tf32=use_tf32,
+        mcts_cache_size=mcts_cache_size,
     )
     run_dir = init_run_dir(config=training_config)
     print(f"日志目录: {run_dir}")
@@ -621,8 +1098,75 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     if eval_interval > 0:
         print(f"评测间隔: 每 {eval_interval} 局, 对局数: {eval_games}, "
               f"对手: {eval_opponent}, 门控: {eval_gate}")
+
+    # 并行模式：num_selfplay_workers > 0 且 device != 'cpu' 且无对手池
+    _use_parallel = (
+        num_selfplay_workers > 0
+        and device != 'cpu'
+        and not use_opponent_pool
+    )
+    if _use_parallel:
+        print(f"并行模式: workers={num_selfplay_workers}, "
+              f"batch_max={inference_batch_size_max}, "
+              f"flush_ms={inference_flush_ms}, "
+              f"precision={inference_precision}")
     print(f"{'='*60}\n")
 
+    # ── 并行自对弈训练路径 ────────────────────────────────────────────────────
+    if _use_parallel:
+        try:
+            _run_parallel_training(
+                model=model,
+                model_path=model_path,
+                num_games=num_games,
+                num_simulations=num_simulations,
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                lr=lr,
+                max_moves=max_moves,
+                buffer_size=buffer_size,
+                save_interval=save_interval,
+                run_dir=run_dir,
+                data_buffer=data_buffer,
+                stats=stats,
+                draw_filter=draw_filter,
+                eval_state=eval_state,
+                baseline_path=baseline_path,
+                pool=pool,
+                eval_interval=eval_interval,
+                eval_games=eval_games,
+                eval_simulations=eval_simulations,
+                eval_opponent=eval_opponent,
+                elo_k=elo_k,
+                eval_gate=eval_gate,
+                repetition_draw_threshold=repetition_draw_threshold,
+                num_selfplay_workers=num_selfplay_workers,
+                inference_batch_size_max=inference_batch_size_max,
+                inference_flush_ms=inference_flush_ms,
+                inference_precision=inference_precision,
+                use_tf32=use_tf32,
+                mcts_cache_size=mcts_cache_size,
+                worker_seed=worker_seed,
+            )
+        finally:
+            if pool is not None:
+                pool.close()
+        model.save(model_path)
+        print(f"\n{'='*60}")
+        print(f"训练完成！")
+        print(f"红方胜: {stats['red_wins']}, "
+              f"黑方胜: {stats['black_wins']}, "
+              f"和棋: {stats['draws']}")
+        total_draws_final = sum(draw_filter.counts.values())
+        total_kept_final = sum(draw_filter.kept.values())
+        print(f"和棋过滤汇总: draw总数={total_draws_final}, "
+              f"进入buffer={total_kept_final} | {draw_filter.summary_str()}")
+        print(f"模型已保存到: {model_path}")
+        print(f"日志目录: {run_dir}")
+        print(f"{'='*60}")
+        return
+
+    # ── 原有单进程串行训练路径 ────────────────────────────────────────────────
     try:
         for game_idx in range(1, num_games + 1):
             start_time = time.time()
@@ -882,6 +1426,41 @@ def main():
                         help='重复局面和棋（repetition/perpetual_check 等）保留概率 (默认: 0.05)')
     parser.add_argument('--draw_filter_seed', type=int, default=0,
                         help='和棋过滤随机数种子，用于可复现抽样 (默认: 0)')
+    # ── 并行自对弈 + GPU batch inference ────────────────────────────────────
+    parser.add_argument(
+        '--num_selfplay_workers', type=int, default=0,
+        help='并行 self-play worker 进程数（0=单进程原逻辑；推荐 Linux+RTX4070 设 6~8，默认: 0）'
+    )
+    parser.add_argument(
+        '--inference_batch_size_max', type=int, default=64,
+        help='推理服务最大 batch 大小（默认: 64）'
+    )
+    parser.add_argument(
+        '--inference_flush_ms', type=float, default=5.0,
+        help='推理服务 flush 超时（毫秒，默认: 5.0）'
+    )
+    parser.add_argument(
+        '--inference_precision', type=str, default='bf16',
+        choices=['bf16', 'fp16', 'fp32'],
+        help="推理精度（默认: 'bf16'；RTX4070 支持 bf16）"
+    )
+    parser.add_argument(
+        '--use_tf32', action='store_true',
+        help='为 matmul/cudnn 启用 TF32（RTX 30/40 系列 GPU 有效，默认关闭）'
+    )
+    parser.add_argument(
+        '--mcts_cache_size', type=int, default=0,
+        help='MCTS 局面评估缓存大小（0=禁用；与并行模式搭配可降低 IPC 开销，默认: 0）'
+    )
+    parser.add_argument(
+        '--worker_seed', type=int, default=42,
+        help='worker 进程随机数基础种子（每个 worker 加上自身 id 保证独立，默认: 42）'
+    )
+    parser.add_argument(
+        '--device', type=str, default='cuda',
+        choices=['cuda', 'cpu'],
+        help="计算设备（'cpu' 时强制走单进程原逻辑，默认: 'cuda'）"
+    )
 
     args = parser.parse_args()
     run_training(**vars(args))
