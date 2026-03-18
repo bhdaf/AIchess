@@ -15,6 +15,12 @@
 
 Kaggle P100 建议预设（1-2 小时）：
   movetime: 30/60/100 ms，num_simulations: 50-100
+
+强度控制（二选一，elo 优先）：
+  - Elo 模式：设置 pikafish_elo_weak/mid/full（如 1000/1500/2000），
+    引擎通过 UCI_LimitStrength + UCI_Elo 选项限制强度；movetime 仍作为
+    搜索时间上限使用。
+  - movetime 模式（默认/兼容旧版）：仅通过 go movetime N 控制强度。
 """
 
 from __future__ import annotations
@@ -46,10 +52,13 @@ class OpponentPool:
         pikafish_movetime_weak: 弱强度引擎思考时间（ms）。
         pikafish_movetime_mid: 中强度引擎思考时间（ms）。
         pikafish_movetime_full: 全强度引擎思考时间（ms）。
+        pikafish_elo_weak: 弱强度引擎目标 Elo；设置后优先于 movetime 控制强度。
+        pikafish_elo_mid: 中强度引擎目标 Elo。
+        pikafish_elo_full: 全强度引擎目标 Elo。
         num_simulations: MCTSAgent 模拟次数（用于 self_play 和 historical）。
         checkpoints_dir: 保存历史 checkpoint 的目录；为 ``None`` 时禁用历史对手。
         curriculum: 课程学习策略名称（``'default'``）或 ``None``（全自对弈）。
-        engine_options: 传给 UCI 引擎的选项字典，如 ``{"UCI_Elo": "1500"}``。
+        engine_options: 传给 UCI 引擎的选项字典，如 ``{"Hash": "256"}``。
         max_history: 历史 checkpoint 池最大容量（超出时删除最旧的）。
     """
 
@@ -60,6 +69,9 @@ class OpponentPool:
         pikafish_movetime_weak: int = 30,
         pikafish_movetime_mid: int = 60,
         pikafish_movetime_full: int = 100,
+        pikafish_elo_weak: Optional[int] = None,
+        pikafish_elo_mid: Optional[int] = None,
+        pikafish_elo_full: Optional[int] = None,
         num_simulations: int = 100,
         checkpoints_dir: Optional[str] = None,
         curriculum: Optional[str] = 'default',
@@ -71,6 +83,9 @@ class OpponentPool:
         self.pikafish_movetime_weak = pikafish_movetime_weak
         self.pikafish_movetime_mid = pikafish_movetime_mid
         self.pikafish_movetime_full = pikafish_movetime_full
+        self.pikafish_elo_weak = pikafish_elo_weak
+        self.pikafish_elo_mid = pikafish_elo_mid
+        self.pikafish_elo_full = pikafish_elo_full
         self.num_simulations = num_simulations
         self.checkpoints_dir = checkpoints_dir
         self.curriculum = curriculum
@@ -171,10 +186,12 @@ class OpponentPool:
         elif opponent_type in ('pikafish_weak', 'pikafish_mid', 'pikafish_full'):
             agent = self._get_pikafish_agent(opponent_type)
             movetime = self._movetime_for(opponent_type)
+            elo = self._elo_for(opponent_type)
             metadata = {
                 'opponent_type': opponent_type,
                 'opponent_strength': opponent_type,
                 'engine_movetime': movetime,
+                'engine_elo': elo,
             }
 
         elif opponent_type == 'historical':
@@ -212,21 +229,36 @@ class OpponentPool:
             'pikafish_full': self.pikafish_movetime_full,
         }[strength]
 
+    def _elo_for(self, strength: str) -> Optional[int]:
+        """返回指定强度对应的目标 Elo；未配置时返回 ``None``。"""
+        return {
+            'pikafish_weak': self.pikafish_elo_weak,
+            'pikafish_mid':  self.pikafish_elo_mid,
+            'pikafish_full': self.pikafish_elo_full,
+        }[strength]
+
     def _get_pikafish_agent(self, strength: str):
         """获取指定强度的 PikafishAgent（延迟创建、复用常驻子进程）。"""
         if strength not in self._pikafish_agents:
             if not self.engine_path:
                 raise ValueError("engine_path 未配置，无法使用 Pikafish 对手")
             movetime = self._movetime_for(strength)
+            elo = self._elo_for(strength)
             from .pikafish_agent import PikafishAgent
             agent = PikafishAgent(
                 self.engine_path,
                 movetime_ms=movetime,
+                elo=elo,
                 options=self.engine_options,
             )
             agent.start()
             self._pikafish_agents[strength] = agent
-            logger.info("启动 Pikafish 引擎（%s，movetime=%d ms）", strength, movetime)
+            if elo is not None:
+                logger.info("启动 Pikafish 引擎（%s，elo=%d，movetime=%d ms）",
+                            strength, elo, movetime)
+            else:
+                logger.info("启动 Pikafish 引擎（%s，movetime=%d ms）",
+                            strength, movetime)
         return self._pikafish_agents[strength]
 
     # ------------------------------------------------------------------
