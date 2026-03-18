@@ -615,8 +615,8 @@ def main():
                         help='蒸馏对局数 (默认: 200)')
     parser.add_argument('--max_moves', type=int, default=200,
                         help='每局最大步数 (默认: 200)')
-    parser.add_argument('--movetime_ms', type=int, default=100,
-                        help='弱引擎每步思考时间 ms (默认: 100)')
+    parser.add_argument('--movetime_ms', type=int, default=300,
+                        help='弱引擎每步思考时间 ms (默认: 300)')
     parser.add_argument('--teacher_movetime_ms', type=int, default=300,
                         help='强引擎每步思考时间 ms (默认: 300)')
     parser.add_argument('--multipv_k', type=int, default=5,
