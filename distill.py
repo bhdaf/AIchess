@@ -640,7 +640,40 @@ def main():
     parser.add_argument('--save_interval', type=int, default=20,
                         help='每隔多少局保存一次模型 (默认: 20)')
 
+     # 【新增参数】支持 Elo 控制
+    parser.add_argument('--engine_elo', type=int, default=None,
+                        help='弱引擎的 Elo 分数（如 1500；优先级高于 engine_options 中的 UCI_Elo）')
+    parser.add_argument('--teacher_elo', type=int, default=None,
+                        help='强引擎的 Elo 分数（如 2800；优先级高于 teacher_options 中的 UCI_Elo）')
+    # 【新增参数】支持自定义引擎选项
+    parser.add_argument('--engine_options', type=str, default=None,
+                        help='传给弱引擎的UCI选项（JSON字符串，如 \'{"Hash":"256"}\'）')
+    parser.add_argument('--teacher_options', type=str, default=None,
+                        help='传给强引擎的UCI选项（JSON字符串，如 \'{"Hash":"512"}\'）')
+
     args = parser.parse_args()
+
+    # 【新增：解析自定义 options 为字典】
+    def parse_options(opt_str):
+        if not opt_str:
+            return {}
+        try:
+            return json.loads(opt_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"解析引擎选项失败：{e}，使用空字典")
+            return {}
+    
+    engine_opts = parse_options(args.engine_options)
+    teacher_opts = parse_options(args.teacher_options)
+    
+    # 【新增：合并 Elo 配置（优先级：命令行 --engine_elo > options 中的 UCI_Elo）】
+    if args.engine_elo is not None:
+        engine_opts["UCI_Elo"] = str(args.engine_elo)
+        engine_opts["UCI_LimitStrength"] = "true"  # 自动启用强度限制
+    if args.teacher_elo is not None:
+        teacher_opts["UCI_Elo"] = str(args.teacher_elo)
+        teacher_opts["UCI_LimitStrength"] = "true"
+      
     run_distill(
         engine_path=args.engine_path,
         out_model=args.out_model,
@@ -660,6 +693,8 @@ def main():
         teacher_temperature=args.teacher_temperature,
         anti_repetition_window=args.anti_repetition_window,
         repetition_draw_threshold=args.repetition_draw_threshold,
+        engine_options=engine_opts,
+        teacher_options=teacher_opts,
     )
 
 
