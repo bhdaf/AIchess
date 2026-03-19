@@ -8,7 +8,7 @@ UCI (Universal Chess Interface) 引擎封装
   3. 发送 "isready"，等待 "readyok"
   4. 每局开始时发送 "ucinewgame"
   5. 每步之前发送 "position fen <FEN>"
-  6. 发送 "go movetime <ms>"，等待 "bestmove <move>"
+  6. 发送 "go movetime <ms>" 或 "go depth <N>"，等待 "bestmove <move>"
   7. 退出时发送 "quit"
 """
 
@@ -35,8 +35,8 @@ class UCIEngine:
             engine.new_game()
             engine.set_position("rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/"
                                  "P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1")
-            best = engine.go_movetime(100)   # 思考 100 ms
-            print(best)                      # e.g. "h2e2"
+            best = engine.go_depth(5)     # 深度 5 搜索
+            print(best)                   # e.g. "h2e2"
     """
 
     def __init__(self, engine_path: str, init_timeout: float = 10.0,

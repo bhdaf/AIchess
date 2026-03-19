@@ -10,7 +10,7 @@
         --engine_path /path/to/pikafish \\
         [--model_path path/to/model.pth] \\
         [--n_games 10] \\
-        [--movetime 100] \\
+        [--elo 1500] \\
         [--ai_side red|black|both] \\
         [--num_simulations 50] \\
         [--out runs/vs_pikafish] \\
@@ -236,13 +236,8 @@ def main() -> None:
         help="对局总数"
     )
     parser.add_argument(
-        "--movetime", type=int, default=100,
-        help="引擎每步思考时间（毫秒）"
-    )
-    parser.add_argument(
         "--elo", type=int, default=None,
-        help="引擎目标 Elo（如 1500）；设置后以 UCI_LimitStrength + UCI_Elo 控制强度，"
-             "优先于 --skill_level。movetime 仍用作搜索时间上限"
+        help="引擎目标 Elo（如 1500）；通过 UCI_LimitStrength + UCI_Elo 控制强度"
     )
     parser.add_argument(
         "--skill_level", type=int, default=None,
@@ -343,7 +338,6 @@ def main() -> None:
     try:
         with PikafishAgent(
             args.engine_path,
-            movetime_ms=args.movetime,
             elo=args.elo,
             skill_level=args.skill_level,
             options=engine_options,

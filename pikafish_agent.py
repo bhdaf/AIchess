@@ -37,6 +37,9 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# 固定的引擎每步思考时间（ms）；强度由 elo 参数（UCI_LimitStrength + UCI_Elo）控制
+_DEFAULT_MOVETIME_MS = 100
+
 
 # ---------------------------------------------------------------------------
 # 统一 Agent 接口
@@ -226,14 +229,15 @@ class PikafishAgent(BaseAgent):
       2. 通过 :class:`~AIchess.uci.UCIEngine` 发送给引擎
       3. 引擎返回 ICCS 格式走法，经 :func:`uci_to_internal` 转换为内部格式
 
+    引擎强度由 ``elo`` 参数（``UCI_LimitStrength + UCI_Elo``）控制。
+
     Args:
         engine_path (str): 引擎可执行文件路径（如 ``"/usr/local/bin/pikafish"``）。
-        movetime_ms (int): 每步思考时间（毫秒），默认 100 ms。
-        depth (int | None): 固定深度搜索；若指定则忽略 ``movetime_ms``。
+        depth (int | None): 固定深度搜索；若指定则以 ``go depth`` 替代默认的
+            ``go movetime``。
         elo (int | None): 目标 Elo 评分（如 ``1500``）；设置后自动启用
-            ``UCI_LimitStrength=true`` 和 ``UCI_Elo=<elo>``，以 Elo 而非
-            movetime 控制引擎强度。同时设置 ``elo`` 和 ``skill_level`` 时，
-            ``elo`` 生效而 ``skill_level`` 被忽略。
+            ``UCI_LimitStrength=true`` 和 ``UCI_Elo=<elo>``。同时设置 ``elo``
+            和 ``skill_level`` 时，``elo`` 生效而 ``skill_level`` 被忽略。
         skill_level (int | None): 引擎技能等级（0‑20）；设置后发送
             ``Skill Level=<skill_level>``。仅在 ``elo`` 未指定时生效。
         options (dict | None): 在握手后通过 ``setoption`` 发送给引擎的选项字典，
@@ -244,23 +248,16 @@ class PikafishAgent(BaseAgent):
 
     Example::
 
-        # 使用 Elo 控制强度（推荐）
         with PikafishAgent("/path/to/pikafish", elo=1500) as agent:
             game = ChessGame().reset()
             agent.new_game()
             move = agent.get_move(game)   # "7072"
             game.step(move)
-
-        # 兼容旧方式：通过 movetime 控制
-        with PikafishAgent("/path/to/pikafish", movetime_ms=50) as agent:
-            agent.new_game()
-            move = agent.get_move(game)
     """
 
     def __init__(
         self,
         engine_path: str,
-        movetime_ms: int = 100,
         depth: Optional[int] = None,
         elo: Optional[int] = None,
         skill_level: Optional[int] = None,
@@ -272,7 +269,6 @@ class PikafishAgent(BaseAgent):
         from .uci import UCIEngine  # 延迟导入，降低无引擎时的依赖成本
 
         self.engine_path = engine_path
-        self.movetime_ms = movetime_ms
         self.depth = depth
         self.elo = elo
         self.skill_level = skill_level
@@ -343,7 +339,7 @@ class PikafishAgent(BaseAgent):
         if self.depth is not None:
             uci_move = self._engine.go_depth(self.depth)
         else:
-            uci_move = self._engine.go_movetime(self.movetime_ms)
+            uci_move = self._engine.go_movetime(_DEFAULT_MOVETIME_MS)
 
         if uci_move is None:
             logger.warning("引擎未返回走法（局面：%s）", uci_fen)
@@ -387,7 +383,7 @@ class PikafishAgent(BaseAgent):
         if self.depth is not None:
             uci_move, info_lines = self._engine.go_depth_with_info(self.depth)
         else:
-            uci_move, info_lines = self._engine.go_movetime_with_info(self.movetime_ms)
+            uci_move, info_lines = self._engine.go_movetime_with_info(_DEFAULT_MOVETIME_MS)
 
         if uci_move is None:
             logger.warning("引擎未返回走法（局面：%s）", uci_fen)

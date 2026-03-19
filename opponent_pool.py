@@ -13,14 +13,9 @@
   - 后 1/3 局：自对弈 30% + pikafish_weak 20% + pikafish_mid 20%
                + pikafish_full 10% + historical 20%
 
-Kaggle P100 建议预设（1-2 小时）：
-  movetime: 30/60/100 ms，num_simulations: 50-100
-
-强度控制（二选一，elo 优先）：
-  - Elo 模式：设置 pikafish_elo_weak/mid/full（如 1000/1500/2000），
-    引擎通过 UCI_LimitStrength + UCI_Elo 选项限制强度；movetime 仍作为
-    搜索时间上限使用。
-  - movetime 模式（默认/兼容旧版）：仅通过 go movetime N 控制强度。
+强度控制（elo 模式）：
+  - 设置 pikafish_elo_weak/mid/full（如 1000/1500/2000），
+    引擎通过 UCI_LimitStrength + UCI_Elo 选项控制强度。
 """
 
 from __future__ import annotations
@@ -49,12 +44,9 @@ class OpponentPool:
     Args:
         model: ChessModel 实例（当前训练模型）。
         engine_path: Pikafish 引擎可执行文件路径；为 ``None`` 时禁用引擎对手。
-        pikafish_movetime_weak: 弱强度引擎思考时间（ms）。
-        pikafish_movetime_mid: 中强度引擎思考时间（ms）。
-        pikafish_movetime_full: 全强度引擎思考时间（ms）。
-        pikafish_elo_weak: 弱强度引擎目标 Elo；设置后优先于 movetime 控制强度。
-        pikafish_elo_mid: 中强度引擎目标 Elo。
-        pikafish_elo_full: 全强度引擎目标 Elo。
+        pikafish_elo_weak: 弱强度引擎目标 Elo（如 1000）；通过 UCI_LimitStrength + UCI_Elo 控制强度。
+        pikafish_elo_mid: 中强度引擎目标 Elo（如 1500）。
+        pikafish_elo_full: 全强度引擎目标 Elo（如 2000）。
         num_simulations: MCTSAgent 模拟次数（用于 self_play 和 historical）。
         checkpoints_dir: 保存历史 checkpoint 的目录；为 ``None`` 时禁用历史对手。
         curriculum: 课程学习策略名称（``'default'``）或 ``None``（全自对弈）。
@@ -66,9 +58,6 @@ class OpponentPool:
         self,
         model,
         engine_path: Optional[str] = None,
-        pikafish_movetime_weak: int = 30,
-        pikafish_movetime_mid: int = 60,
-        pikafish_movetime_full: int = 100,
         pikafish_elo_weak: Optional[int] = None,
         pikafish_elo_mid: Optional[int] = None,
         pikafish_elo_full: Optional[int] = None,
@@ -80,9 +69,6 @@ class OpponentPool:
     ) -> None:
         self.model = model
         self.engine_path = engine_path
-        self.pikafish_movetime_weak = pikafish_movetime_weak
-        self.pikafish_movetime_mid = pikafish_movetime_mid
-        self.pikafish_movetime_full = pikafish_movetime_full
         self.pikafish_elo_weak = pikafish_elo_weak
         self.pikafish_elo_mid = pikafish_elo_mid
         self.pikafish_elo_full = pikafish_elo_full
@@ -180,17 +166,15 @@ class OpponentPool:
             metadata = {
                 'opponent_type': 'self_play',
                 'opponent_strength': 'current',
-                'engine_movetime': None,
+                'engine_elo': None,
             }
 
         elif opponent_type in ('pikafish_weak', 'pikafish_mid', 'pikafish_full'):
             agent = self._get_pikafish_agent(opponent_type)
-            movetime = self._movetime_for(opponent_type)
             elo = self._elo_for(opponent_type)
             metadata = {
                 'opponent_type': opponent_type,
                 'opponent_strength': opponent_type,
-                'engine_movetime': movetime,
                 'engine_elo': elo,
             }
 
@@ -202,14 +186,14 @@ class OpponentPool:
                 metadata = {
                     'opponent_type': 'self_play',
                     'opponent_strength': 'current',
-                    'engine_movetime': None,
+                    'engine_elo': None,
                     'fallback_from': 'historical',
                 }
             else:
                 metadata = {
                     'opponent_type': 'historical',
                     'opponent_strength': 'historical',
-                    'engine_movetime': None,
+                    'engine_elo': None,
                 }
 
         else:
@@ -220,14 +204,6 @@ class OpponentPool:
     # ------------------------------------------------------------------
     # Pikafish 引擎管理
     # ------------------------------------------------------------------
-
-    def _movetime_for(self, strength: str) -> int:
-        """返回指定强度对应的 movetime（ms）。"""
-        return {
-            'pikafish_weak': self.pikafish_movetime_weak,
-            'pikafish_mid':  self.pikafish_movetime_mid,
-            'pikafish_full': self.pikafish_movetime_full,
-        }[strength]
 
     def _elo_for(self, strength: str) -> Optional[int]:
         """返回指定强度对应的目标 Elo；未配置时返回 ``None``。"""
@@ -242,23 +218,19 @@ class OpponentPool:
         if strength not in self._pikafish_agents:
             if not self.engine_path:
                 raise ValueError("engine_path 未配置，无法使用 Pikafish 对手")
-            movetime = self._movetime_for(strength)
             elo = self._elo_for(strength)
             from .pikafish_agent import PikafishAgent
             agent = PikafishAgent(
                 self.engine_path,
-                movetime_ms=movetime,
                 elo=elo,
                 options=self.engine_options,
             )
             agent.start()
             self._pikafish_agents[strength] = agent
             if elo is not None:
-                logger.info("启动 Pikafish 引擎（%s，elo=%d，movetime=%d ms）",
-                            strength, elo, movetime)
+                logger.info("启动 Pikafish 引擎（%s，elo=%d）", strength, elo)
             else:
-                logger.info("启动 Pikafish 引擎（%s，movetime=%d ms）",
-                            strength, movetime)
+                logger.info("启动 Pikafish 引擎（%s）", strength)
         return self._pikafish_agents[strength]
 
     # ------------------------------------------------------------------
