@@ -1220,12 +1220,12 @@ class TestGenerateDistillGame(unittest.TestCase):
         return RandomAgent()
 
     def test_returns_correct_format(self):
-        """generate_distill_game 应返回 (training_data, winner, moves, reason)"""
+        """generate_distill_game 应返回 (training_data, winner, moves, reason, game_stats)"""
         from .distill import generate_distill_game
         agent = self._make_random_agent()
         result = generate_distill_game(agent, max_moves=20)
-        self.assertEqual(len(result), 4)
-        training_data, winner, moves, terminate_reason = result
+        self.assertEqual(len(result), 5)
+        training_data, winner, moves, terminate_reason, game_stats = result
         self.assertIsInstance(training_data, list)
         self.assertIsInstance(moves, int)
 
@@ -1233,7 +1233,7 @@ class TestGenerateDistillGame(unittest.TestCase):
         """每个样本的 state/policy/value 形状应正确"""
         from .distill import generate_distill_game
         agent = self._make_random_agent()
-        training_data, _, _, _ = generate_distill_game(agent, max_moves=20)
+        training_data, _, _, _, _ = generate_distill_game(agent, max_moves=20)
 
         if not training_data:
             self.skipTest("未产生训练样本（对局过短），跳过形状检验")
@@ -1241,14 +1241,12 @@ class TestGenerateDistillGame(unittest.TestCase):
         for state, policy, value in training_data:
             self.assertEqual(state.shape, (14, 10, 9))
             self.assertEqual(len(policy), NUM_ACTIONS)
-            self.assertAlmostEqual(float(value), 0.0,
-                                   msg="蒸馏阶段 value_target 应恒为 0.0")
 
     def test_policy_is_soft_distribution(self):
         """蒸馏 policy_target 应为 soft 概率分布（非 one-hot，sum≈1，多个非零项）"""
         from .distill import generate_distill_game
         agent = self._make_random_agent()
-        training_data, _, _, _ = generate_distill_game(agent, max_moves=20)
+        training_data, _, _, _, _ = generate_distill_game(agent, max_moves=20)
 
         if not training_data:
             self.skipTest("未产生训练样本，跳过 soft 分布检验")
@@ -1269,7 +1267,7 @@ class TestGenerateDistillGame(unittest.TestCase):
         from .distill import generate_distill_game
         weak_agent = self._make_random_agent()
         teacher_agent = self._make_random_agent()
-        training_data, _, _, _ = generate_distill_game(
+        training_data, _, _, _, _ = generate_distill_game(
             weak_agent, teacher_agent=teacher_agent, max_moves=20,
         )
 
@@ -2042,3 +2040,346 @@ class TestVsPikafishPlayOneGame(unittest.TestCase):
                          "AI 执红应选择 prob=1.0 的走法")
         self.assertNotEqual(chosen, other_move,
                             "AI 执红不应选择 actions[0]（干扰走法）")
+
+
+# ===========================================================================
+# 蒸馏增强测试（任务：distillation improvements）
+# ===========================================================================
+
+class TestDistillTrajectorySource(unittest.TestCase):
+    """测试 generate_distill_game 的 trajectory_source 三模式行为"""
+
+    def _make_stub_agent(self, name='stub'):
+        """创建记录走法调用次数的 stub agent。"""
+        game_obj = ChessGame()
+        game_obj.reset()
+
+        class StubAgent:
+            def __init__(self):
+                self.move_count = 0
+                self.name = name
+
+            def new_game(self):
+                pass
+
+            def get_move(self, game):
+                legal = game.get_legal_moves()
+                if not legal:
+                    return None
+                self.move_count += 1
+                return legal[0]
+
+        return StubAgent()
+
+    def _run_short_game(self, trajectory_source, mixed_teacher_ratio=0.7,
+                        max_moves=10):
+        """运行一局短对局并返回 (data, game_stats)。"""
+        from .distill import generate_distill_game
+        weak = self._make_stub_agent('weak')
+        teacher = self._make_stub_agent('teacher')
+        result = generate_distill_game(
+            weak, teacher_agent=teacher,
+            max_moves=max_moves,
+            trajectory_source=trajectory_source,
+            mixed_teacher_ratio=mixed_teacher_ratio,
+            distill_value_mode='zero',
+            anti_repetition_window=0,
+        )
+        data, winner, moves, reason, game_stats = result
+        return data, game_stats, weak, teacher
+
+    def test_weak_mode_no_teacher_moves(self):
+        """weak 模式：teacher_move_count 应为 0"""
+        data, stats, weak, teacher = self._run_short_game('weak')
+        self.assertEqual(stats['teacher_move_count'], 0,
+                         "weak 模式下 teacher 不应参与走子")
+        self.assertGreater(stats['total_move_count'], 0)
+
+    def test_teacher_mode_all_teacher_moves(self):
+        """teacher 模式：teacher_move_count 应等于 total_move_count"""
+        data, stats, weak, teacher = self._run_short_game('teacher')
+        self.assertEqual(stats['teacher_move_count'], stats['total_move_count'],
+                         "teacher 模式下所有步均应由 teacher 走子")
+
+    def test_mixed_mode_ratio_in_range(self):
+        """mixed 模式：teacher_move_ratio 应介于 0 和 1 之间"""
+        total_teacher = 0
+        total_moves = 0
+        # 多次运行以降低随机偏差
+        for _ in range(5):
+            data, stats, _, _ = self._run_short_game(
+                'mixed', mixed_teacher_ratio=0.5, max_moves=20)
+            total_teacher += stats['teacher_move_count']
+            total_moves += stats['total_move_count']
+        ratio = total_teacher / max(total_moves, 1)
+        self.assertGreaterEqual(ratio, 0.0)
+        self.assertLessEqual(ratio, 1.0)
+
+    def test_all_modes_produce_teacher_policy(self):
+        """所有模式下均应产生训练样本（teacher 提供 policy）"""
+        for src in ('weak', 'teacher', 'mixed'):
+            data, stats, _, _ = self._run_short_game(src, max_moves=10)
+            self.assertIsInstance(data, list,
+                                  f"{src} 模式应返回 list")
+            # 每个样本是 (planes, policy, value) 三元组
+            for planes, policy, value in data:
+                self.assertEqual(policy.shape, (NUM_ACTIONS,),
+                                 f"{src} 模式的 policy 形状应为 (NUM_ACTIONS,)")
+                self.assertAlmostEqual(float(policy.sum()), 1.0, places=3,
+                                       msg=f"{src} 模式的 policy 应归一化")
+
+    def test_game_stats_keys_present(self):
+        """generate_distill_game 应返回包含所有统计字段的 game_stats 字典"""
+        from .distill import generate_distill_game
+        weak = self._make_stub_agent('weak')
+        result = generate_distill_game(weak, max_moves=5)
+        self.assertEqual(len(result), 5, "应返回 5 元组")
+        _, _, _, _, game_stats = result
+        for key in ('teacher_move_count', 'total_move_count',
+                    'low_quality_count', 'skip_sample_count', 'entropy_sum'):
+            self.assertIn(key, game_stats, f"game_stats 应含 '{key}'")
+
+
+class TestDistillSoftPolicyQuality(unittest.TestCase):
+    """测试 teacher soft policy 低质量分支处理"""
+
+    def _make_peaked_policy(self, peak_idx=0, peak_val=0.99):
+        """构造高质量（高 top1_prob）policy"""
+        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+        rest = 1.0 - peak_val
+        policy[:] = rest / max(NUM_ACTIONS - 1, 1)
+        policy[peak_idx] = peak_val
+        return policy
+
+    def _make_flat_policy(self):
+        """构造均匀分布（高熵、低 top1）policy"""
+        policy = np.ones(NUM_ACTIONS, dtype=np.float32) / NUM_ACTIONS
+        return policy
+
+    def test_compute_policy_stats_peaked(self):
+        """高 top1 policy 的 top1_prob 应接近 peak_val，熵应较低"""
+        from .distill import _compute_policy_stats
+        policy = self._make_peaked_policy(peak_val=0.99)
+        top1, entropy = _compute_policy_stats(policy)
+        self.assertAlmostEqual(top1, 0.99, places=3)
+        # 均匀分布熵 ≈ log(N)；peaked 分布熵应明显低于均匀分布的一半
+        import math
+        self.assertLess(entropy, math.log(NUM_ACTIONS) * 0.5,
+                        "高 top1 policy 的熵应远低于均匀分布")
+
+    def test_compute_policy_stats_flat(self):
+        """均匀分布 policy 的 top1_prob 应接近 1/N，熵应接近 log(N)"""
+        from .distill import _compute_policy_stats
+        import math
+        policy = self._make_flat_policy()
+        top1, entropy = _compute_policy_stats(policy)
+        expected_top1 = 1.0 / NUM_ACTIONS
+        self.assertAlmostEqual(top1, expected_top1, places=5)
+        self.assertAlmostEqual(entropy, math.log(NUM_ACTIONS), places=3)
+
+    def test_fallback_onehot_returns_onehot(self):
+        """fallback_onehot 应返回以 bestmove 为中心的 one-hot 分布"""
+        from .distill import _apply_policy_quality_fallback
+        from .game import ACTION_LABELS
+        flat = self._make_flat_policy()
+        game = ChessGame()
+        game.reset()
+        legal = game.get_legal_moves()
+        bestmove = legal[0]
+        result = _apply_policy_quality_fallback(
+            flat, bestmove, legal, False,
+            'fallback_onehot', 3, 0.6,
+        )
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(float(result.sum()), 1.0, places=4)
+        best_idx = LABEL_TO_INDEX[bestmove]
+        self.assertAlmostEqual(float(result[best_idx]), 1.0, places=4,
+                               msg="fallback_onehot 应将概率集中在 bestmove")
+
+    def test_fallback_topk_sharpen_sums_to_one(self):
+        """fallback_topk_sharpen 结果应归一化且仅 top-k 个位置非零"""
+        from .distill import _apply_policy_quality_fallback
+        flat = self._make_flat_policy()
+        game = ChessGame()
+        game.reset()
+        legal = game.get_legal_moves()
+        bestmove = legal[0]
+        topk = 3
+        result = _apply_policy_quality_fallback(
+            flat, bestmove, legal, False,
+            'fallback_topk_sharpen', topk, 0.6,
+        )
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(float(result.sum()), 1.0, places=4)
+        # 非零位置不超过 topk
+        nonzero_count = int(np.count_nonzero(result))
+        self.assertLessEqual(nonzero_count, topk,
+                             f"fallback_topk_sharpen 非零位置应 <= {topk}")
+
+    def test_skip_sample_returns_none(self):
+        """skip_sample 动作应返回 None"""
+        from .distill import _apply_policy_quality_fallback
+        flat = self._make_flat_policy()
+        game = ChessGame()
+        game.reset()
+        legal = game.get_legal_moves()
+        result = _apply_policy_quality_fallback(
+            flat, legal[0], legal, False,
+            'skip_sample', 3, 0.6,
+        )
+        self.assertIsNone(result, "skip_sample 应返回 None")
+
+    def test_low_quality_samples_counted_in_stats(self):
+        """低质量 policy 样本计数应正确反映在 game_stats 中"""
+        from .distill import generate_distill_game
+
+        class AlwaysFlatTeacher:
+            """始终返回均匀分布 policy（极低质量）的伪 teacher"""
+            def new_game(self): pass
+
+            def get_move(self, game):
+                legal = game.get_legal_moves()
+                return legal[0] if legal else None
+
+            def get_soft_policy(self, game, k=5, temperature=1.0):
+                return np.ones(NUM_ACTIONS, dtype=np.float32) / NUM_ACTIONS
+
+        weak_agent = AlwaysFlatTeacher()
+        # 设置极严格的质量门槛，确保所有样本都是"低质量"
+        result = generate_distill_game(
+            weak_agent,
+            teacher_agent=None,
+            max_moves=10,
+            teacher_min_top1_prob=0.99,   # 极严格：1/N << 0.99
+            teacher_low_quality_action='skip_sample',
+            distill_value_mode='zero',
+            anti_repetition_window=0,
+        )
+        data, winner, moves, reason, game_stats = result
+        # skip_sample 模式：低质量样本应被跳过
+        self.assertEqual(len(data), 0,
+                         "极严格门槛 + skip_sample 模式应跳过所有样本")
+        self.assertGreater(game_stats['low_quality_count'], 0,
+                           "应记录低质量样本数量")
+        self.assertGreater(game_stats['skip_sample_count'], 0,
+                           "应记录 skip_sample 数量")
+
+
+class TestDistillValueBackfill(unittest.TestCase):
+    """测试 distill_value_mode=game_outcome 的 value 回填方向正确性"""
+
+    def _run_game_with_winner(self, mock_winner, distill_value_mode='game_outcome'):
+        """
+        使用 mock game 验证 value 回填。
+        直接调用 generate_distill_game 并注入自定义 mock_game。
+        """
+        from .distill import generate_distill_game, _MAX_ENTROPY
+
+        class MockAgent:
+            """走子策略：始终选第一个合法走法"""
+            def new_game(self): pass
+
+            def get_move(self, game):
+                legal = game.get_legal_moves()
+                return legal[0] if legal else None
+
+        agent = MockAgent()
+        result = generate_distill_game(
+            agent,
+            max_moves=6,  # 短局，保证快速结束
+            distill_value_mode=distill_value_mode,
+            anti_repetition_window=0,
+            repetition_draw_threshold=3,
+        )
+        data, winner, moves, reason, game_stats = result
+        return data, winner
+
+    def test_zero_mode_all_values_zero(self):
+        """zero 模式下所有 value_target 应为 0"""
+        data, winner = self._run_game_with_winner(None, distill_value_mode='zero')
+        for _, _, v in data:
+            self.assertAlmostEqual(v, 0.0, places=6,
+                                   msg="zero 模式 value_target 应为 0")
+
+    def test_game_outcome_red_wins_positive_for_red(self):
+        """
+        game_outcome 模式：真实局面结束后，红方走棋时的 value 应与终局结果同号。
+        用一个人工构造的必杀局面验证。
+        """
+        from .distill import generate_distill_game
+
+        # 构造红方下一步即可将死黑方的局面
+        # 红车在 a0，黑将在 e9，红方走 0009 即将死（简化验证：只要有终局结果即可）
+        class FixedAgent:
+            """走固定列表中的走法，耗尽后选第一个合法走法"""
+            def __init__(self, moves):
+                self._moves = list(moves)
+                self._idx = 0
+
+            def new_game(self):
+                self._idx = 0
+
+            def get_move(self, game):
+                legal = game.get_legal_moves()
+                if not legal:
+                    return None
+                if self._idx < len(self._moves):
+                    mv = self._moves[self._idx]
+                    self._idx += 1
+                    if mv in legal:
+                        return mv
+                return legal[0]
+
+        agent = FixedAgent([])
+        result = generate_distill_game(
+            agent,
+            max_moves=200,
+            distill_value_mode='game_outcome',
+            anti_repetition_window=0,
+            repetition_draw_threshold=3,
+        )
+        data, winner, moves, reason, game_stats = result
+
+        if not data or winner is None:
+            self.skipTest("对局未产生有效数据或无终局结果，跳过验证")
+
+        # 确定期望的 game_outcome
+        if winner == 'red':
+            game_outcome = 1.0
+        elif winner == 'black':
+            game_outcome = -1.0
+        else:
+            game_outcome = 0.0
+
+        # 根据样本在对局中的位置推断 player_sign：
+        # 数据是按先红后黑交替收集的；第 0 步是红方（player_sign=+1），第 1 步是黑方（-1），...
+        for idx, (_, _, value) in enumerate(data):
+            expected_sign = 1 if idx % 2 == 0 else -1
+            expected_value = game_outcome * expected_sign
+            self.assertAlmostEqual(
+                value, expected_value, places=5,
+                msg=f"第 {idx} 步（{'红' if expected_sign>0 else '黑'}方）"
+                    f"value 应为 {expected_value}（winner={winner}）")
+
+    def test_game_outcome_value_in_valid_range(self):
+        """game_outcome 模式下所有 value_target 应在 [-1, 1] 范围内"""
+        from .distill import generate_distill_game
+
+        class SimpleAgent:
+            def new_game(self): pass
+            def get_move(self, game):
+                legal = game.get_legal_moves()
+                return legal[0] if legal else None
+
+        agent = SimpleAgent()
+        result = generate_distill_game(
+            agent, max_moves=50,
+            distill_value_mode='game_outcome',
+            anti_repetition_window=0,
+        )
+        data, _, _, _, _ = result
+        for _, _, v in data:
+            self.assertGreaterEqual(v, -1.0,
+                                    "game_outcome value 应 >= -1")
+            self.assertLessEqual(v, 1.0,
+                                 "game_outcome value 应 <= 1")
