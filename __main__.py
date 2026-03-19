@@ -23,7 +23,7 @@
 
     与 Pikafish/UCI 引擎对弈:
         python -m AIchess vs_pikafish --engine_path /path/to/pikafish \\
-            [--model_path model.pth] [--n_games 10] [--movetime 100]
+            [--model_path model.pth] [--n_games 10] [--elo 1500]
 """
 
 import sys

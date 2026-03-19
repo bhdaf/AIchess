@@ -18,15 +18,15 @@
 
 用法示例
 --------
-阶段 A 蒸馏（弱-vs-弱 走子，强引擎标注）::
+阶段 A 蒸馏（弱-vs-弱 走子，强引擎标注；引擎强度通过 --engine_elo/teacher_elo 控制）::
 
     python -m AIchess distill \\
         --engine_path /path/to/pikafish_weak \\
         --teacher_engine_path /path/to/pikafish_strong \\
         --out_model saved_model/model_distill.pth \\
         --n_games 200 \\
-        --movetime_ms 100 \\
-        --teacher_movetime_ms 300 \\
+        --engine_elo 1500 \\
+        --teacher_elo 2800 \\
         --multipv_k 5
 
 阶段 B RL 微调（使用蒸馏权重为起点，并放宽重复判和阈值）::
@@ -590,7 +590,6 @@ def run_distill(
     model_path: str = None,
     n_games: int = 200,
     max_moves: int = 200,
-    movetime_ms: int = 100,
     batch_size: int = 256,
     epochs: int = 5,
     lr: float = 0.001,
@@ -599,7 +598,6 @@ def run_distill(
     save_interval: int = 20,
     engine_options: dict = None,
     teacher_engine_path: str = None,
-    teacher_movetime_ms: int = 300,
     teacher_options: dict = None,
     multipv_k: int = 5,
     teacher_temperature: float = 1.0,
@@ -631,7 +629,6 @@ def run_distill(
                                   否则创建新模型。
         n_games:                  蒸馏对局数（默认 200）。
         max_moves:                每局最大步数（默认 200）。
-        movetime_ms:              弱引擎每步思考时间（ms，默认 100）。
         batch_size:               批大小（默认 256）。
         epochs:                   每批训练轮数（默认 5）。
         lr:                       学习率（默认 0.001）。
@@ -640,7 +637,6 @@ def run_distill(
         save_interval:            每隔多少局保存一次模型（默认 20）。
         engine_options:           传给弱引擎的选项字典（如 ``{"UCI_Elo": "1500"}``）。
         teacher_engine_path:      强引擎路径；若为 ``None`` 则复用弱引擎（unified 模式）。
-        teacher_movetime_ms:      强引擎每步思考时间（ms，默认 300）。
         teacher_options:          传给强引擎的选项字典。
         multipv_k:                Teacher MultiPV 候选数量（默认 5）。
         teacher_temperature:      Softmax 温度（默认 1.0）。
@@ -680,8 +676,6 @@ def run_distill(
         teacher_engine_path=teacher_engine_path or engine_path,
         n_games=n_games,
         max_moves=max_moves,
-        movetime_ms=movetime_ms,
-        teacher_movetime_ms=teacher_movetime_ms,
         multipv_k=multipv_k,
         teacher_temperature=teacher_temperature,
         batch_size=batch_size,
@@ -707,9 +701,9 @@ def run_distill(
 
     print(f"\n{'='*60}")
     print(f"阶段 A：Pikafish 策略蒸馏（soft target）")
-    print(f"弱引擎: {engine_path}，思考时间: {movetime_ms} ms")
+    print(f"弱引擎: {engine_path}")
     teacher_desc = teacher_engine_path or engine_path
-    print(f"Teacher:  {teacher_desc}，思考时间: {teacher_movetime_ms} ms，MultiPV: {multipv_k}")
+    print(f"Teacher:  {teacher_desc}，MultiPV: {multipv_k}")
     print(f"总局数: {n_games}，价值损失权重: {value_loss_weight}")
     print(f"轨迹来源: {trajectory_source}（mixed_teacher_ratio={mixed_teacher_ratio}）")
     print(f"value 监督模式: {distill_value_mode}")
@@ -727,7 +721,6 @@ def run_distill(
                 model=model,
                 engine_path=eval_engine_path,
                 n_games=n,
-                movetime=movetime_ms,
                 engine_options={'UCI_Elo': str(elo), 'UCI_LimitStrength': 'true'},
                 ai_side='both',
                 verbose=False,
@@ -883,11 +876,10 @@ def run_distill(
 
     if use_separate_teacher:
         with PikafishAgent(
-            engine_path, movetime_ms=movetime_ms, options=weak_opts
+            engine_path, options=weak_opts
         ) as weak_agent:
             with PikafishAgent(
                 teacher_engine_path,
-                movetime_ms=teacher_movetime_ms,
                 options=strong_opts,
                 multipv=multipv_k,
             ) as teacher_agent:
@@ -896,7 +888,7 @@ def run_distill(
         # Unified mode: same engine instance acts as both weak player and teacher.
         # MultiPV is set dynamically inside get_soft_policy().
         with PikafishAgent(
-            engine_path, movetime_ms=movetime_ms, options=weak_opts
+            engine_path, options=weak_opts
         ) as agent:
             _run_games(agent, None)
 
@@ -926,7 +918,7 @@ def main():
       --engine_path /path/to/pikafish_weak \\
       --teacher_engine_path /path/to/pikafish_strong \\
       --out_model saved_model/model_distill.pth \\
-      --n_games 10 --movetime_ms 50 --multipv_k 5 \\
+      --n_games 10 --multipv_k 5 \\
       --trajectory_source mixed --distill_value_mode game_outcome
 
 示例（正式训练，teacher 走子 + 质量控制）:
@@ -934,7 +926,7 @@ def main():
       --engine_path /path/to/pikafish_weak \\
       --teacher_engine_path /path/to/pikafish_strong \\
       --out_model saved_model/model_distill.pth \\
-      --n_games 200 --movetime_ms 100 --multipv_k 5 \\
+      --n_games 200 --multipv_k 5 \\
       --trajectory_source teacher \\
       --teacher_min_top1_prob 0.3 \\
       --teacher_low_quality_action fallback_topk_sharpen \\
@@ -961,10 +953,6 @@ def main():
                         help='蒸馏对局数 (默认: 200)')
     parser.add_argument('--max_moves', type=int, default=200,
                         help='每局最大步数 (默认: 200)')
-    parser.add_argument('--movetime_ms', type=int, default=300,
-                        help='弱引擎每步思考时间 ms (默认: 300)')
-    parser.add_argument('--teacher_movetime_ms', type=int, default=300,
-                        help='强引擎每步思考时间 ms (默认: 300)')
     parser.add_argument('--multipv_k', type=int, default=5,
                         help='Teacher MultiPV 候选数量 (默认: 5，最小 2)')
     parser.add_argument('--teacher_temperature', type=float, default=1.0,
@@ -1067,7 +1055,6 @@ def main():
         model_path=args.model_path,
         n_games=args.n_games,
         max_moves=args.max_moves,
-        movetime_ms=args.movetime_ms,
         batch_size=args.batch_size,
         epochs=args.epochs,
         lr=args.lr,
@@ -1075,7 +1062,6 @@ def main():
         buffer_size=args.buffer_size,
         save_interval=args.save_interval,
         teacher_engine_path=args.teacher_engine_path,
-        teacher_movetime_ms=args.teacher_movetime_ms,
         multipv_k=args.multipv_k,
         teacher_temperature=args.teacher_temperature,
         anti_repetition_window=args.anti_repetition_window,

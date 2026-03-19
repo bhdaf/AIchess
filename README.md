@@ -112,9 +112,9 @@ python -m AIchess train \
     --max_moves 200 \
     --my_side alternate \
     --curriculum default \
-    --pikafish_movetime_weak 30 \
-    --pikafish_movetime_mid 60 \
-    --pikafish_movetime_full 100 \
+    --pikafish_elo_weak 1000 \
+    --pikafish_elo_mid 1500 \
+    --pikafish_elo_full 2000 \
     --eval_interval 20 \
     --eval_games 20 \
     --eval_gate 0.55 \
@@ -143,9 +143,9 @@ python -m AIchess train \
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--engine_path` | None | Pikafish 等 UCI 引擎路径；提供后启用对手池 |
-| `--pikafish_movetime_weak` | 30 | 弱强度思考时间（ms） |
-| `--pikafish_movetime_mid` | 60 | 中强度思考时间（ms） |
-| `--pikafish_movetime_full` | 100 | 全强度思考时间（ms） |
+| `--pikafish_elo_weak` | None | 弱强度引擎目标 Elo（如 1000）；通过 UCI_Elo 控制强度 |
+| `--pikafish_elo_mid` | None | 中强度引擎目标 Elo（如 1500） |
+| `--pikafish_elo_full` | None | 全强度引擎目标 Elo（如 2000） |
 | `--curriculum` | default | 课程策略：`default` 或 `none`（纯自对弈） |
 | `--my_side` | alternate | 我方执哪方：`red`/`black`/`alternate` |
 | `--eval_gate` | 0.55 | 评测门控阈值 |
@@ -323,12 +323,12 @@ python -m unittest AIchess.tests -v
 # 下载并编译 Pikafish（或从 release 下载预编译版本）
 # https://github.com/official-pikafish/Pikafish/releases
 
-# AI 执红，与 Pikafish（100 ms 每步）对弈 10 局
+# AI 与 Pikafish（Elo=1500）对弈 10 局
 python -m AIchess vs_pikafish \
     --engine_path /path/to/pikafish \
     --model_path saved_model/model.pth \
     --n_games 10 \
-    --movetime 100 \
+    --elo 1500 \
     --ai_side both \
     --num_simulations 50 \
     --out runs/vs_pikafish_001
@@ -338,7 +338,6 @@ python -m AIchess vs_pikafish \
     --engine_path /path/to/pikafish \
     --model_path saved_model/model.pth \
     --n_games 20 \
-    --movetime 50 \
     --engine_options "UCI_LimitStrength=true" "UCI_Elo=1500" \
     --out runs/vs_pikafish_elo1500
 ```
@@ -394,9 +393,9 @@ class BaseAgent(ABC):
 ```text
 OpponentPool
 ├── self_play       权重 α（当前模型自对弈）
-├── pikafish_weak   权重 β（限制强度的 Pikafish，如 Elo≈1500）
-├── pikafish_mid    权重 γ（中等强度，如 Elo≈2000）
-├── pikafish_full   权重 δ（全强度，movetime=100ms）
+├── pikafish_weak   权重 β（限制强度的 Pikafish，如 Elo=1000）
+├── pikafish_mid    权重 γ（中等强度，如 Elo=1500）
+├── pikafish_full   权重 δ（较高强度，如 Elo=2000）
 └── historical      权重 ε（随机选历史检查点，防止策略坍塌）
 ```
 
@@ -464,7 +463,7 @@ for iteration in range(max_iterations):
 | 优化点 | 建议 |
 |--------|------|
 | 并行自对弈 | 使用 `multiprocessing.Pool` 并行生成对局数据 |
-| 引擎思考时间 | 训练期从 `movetime=10ms` 起步，强化期再逐步增加 |
+| 引擎强度 | 通过 `--pikafish_elo_weak/mid/full` 设置 Elo，仅依赖 UCI_Elo 控制强度 |
 | MCTS 模拟次数 | 训练期用 50–100，推理期用 200–400 |
 | 位置缓存 | 开启 `MCTS(cache_size=2000)` 减少重复评估 |
 | 引擎进程复用 | `PikafishAgent` 保持进程常驻，避免每局重启 |
@@ -476,7 +475,7 @@ for iteration in range(max_iterations):
 | 规则不一致（长将/长捉/重复等） | 高 | 跑 100 局快速对局，检查异常终止率 | 在 `PikafishAgent.get_move()` 中添加合法性验证；规则差异较大时考虑关闭引擎的特殊规则 |
 | FEN 格式不兼容 | 中 | 比对 `game_to_uci_fen()` 输出与引擎期望格式 | 查阅 Pikafish 文档；必要时调整 FEN 字段顺序 |
 | 一直输导致梯度贫瘠 | 高 | 监控 value loss 是否趋近于常数 | 严格执行课程学习；初期以弱引擎为主要对手 |
-| 速度瓶颈 | 中 | 测量每局耗时 | 降低 movetime + num_simulations；多进程并行 |
+| 速度瓶颈 | 中 | 测量每局耗时 | 降低 num_simulations；多进程并行 |
 | 策略坍塌（遗忘） | 中 | 定期与历史模型对战 | 历史模型池 + 混合 self-play 比例 |
 | 数据分布偏移 | 低 | 监控训练数据来源比例 | 限制 replay_buffer 中引擎对局数据的比例上限 |
 
@@ -505,7 +504,7 @@ python -m AIchess distill \
     --engine_path /path/to/pikafish \
     --teacher_engine_path /path/to/pikafish_strong \
     --out_model saved_model/model_distill.pth \
-    --n_games 10 --movetime_ms 50 --multipv_k 5 \
+    --n_games 10 --multipv_k 5 \
     --trajectory_source mixed \
     --distill_value_mode game_outcome
 ```
@@ -517,7 +516,7 @@ python -m AIchess distill \
     --engine_path /path/to/pikafish_weak \
     --teacher_engine_path /path/to/pikafish_strong \
     --out_model saved_model/model_distill.pth \
-    --n_games 200 --movetime_ms 100 --multipv_k 5 \
+    --n_games 200 --multipv_k 5 \
     --trajectory_source teacher \
     --mixed_teacher_ratio 0.7 \
     --teacher_min_top1_prob 0.3 \
