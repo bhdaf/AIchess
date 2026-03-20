@@ -764,11 +764,11 @@ def _do_eval(
     """执行一次模型评测并更新 ELO 状态（供主循环复用）。"""
     print(f"  [评测] 第 {game_idx} 局，开始评测...")
     if eval_opponent == "self":
-        opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+        opponent_model = ChessModel(num_channels=256, num_res_blocks=16)
         opponent_model.build()
         opponent_label = "self"
     else:
-        opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+        opponent_model = ChessModel(num_channels=256, num_res_blocks=16)
         if os.path.exists(baseline_path):
             opponent_model.load(baseline_path)
         else:
@@ -999,7 +999,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
     model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
 
     # 初始化模型
-    model = ChessModel(num_channels=128, num_res_blocks=4)
+    model = ChessModel(num_channels=256, num_res_blocks=16)
     if init_from_distill and os.path.exists(init_from_distill):
         # 阶段 B：以蒸馏权重为起点（忽略 model_path 中可能存在的旧权重）
         print(f"从蒸馏模型加载权重: {init_from_distill}")
@@ -1287,12 +1287,12 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
             if eval_interval > 0 and game_idx % eval_interval == 0:
                 print(f"  [评测] 第 {game_idx} 局，开始评测...")
                 if eval_opponent == 'self':
-                    opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+                    opponent_model = ChessModel(num_channels=256, num_res_blocks=16)
                     opponent_model.build()
                     opponent_label = 'self'
                 else:
                     # 'previous': 对战上一个基准模型
-                    opponent_model = ChessModel(num_channels=128, num_res_blocks=4)
+                    opponent_model = ChessModel(num_channels=256, num_res_blocks=16)
                     if os.path.exists(baseline_path):
                         opponent_model.load(baseline_path)
                     else:
