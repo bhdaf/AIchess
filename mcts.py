@@ -216,14 +216,14 @@ class MCTS:
             path.append(node)
 
         # 评估叶子节点
+        # value_for_current_player：以"当前将要走子的一方"为正方向
+        #   +1.0 = 该方赢，-1.0 = 该方输（被将死），0.0 = 平局
         if game.done:
             if game.winner == 'draw':
-                value = 0.0
+                value_for_current_player = 0.0
             else:
-                # 从当前走子方视角看：对手赢了 = -1
-                value = -1.0
-            # 与非终局情形保持一致：翻转到父节点视角再回传
-            value = -value
+                # 到达终局时，轮到走子的一方已被将死，故为 -1.0
+                value_for_current_player = -1.0
         else:
             # 获取合法走法（在网络调用前计算，用于掩码）
             legal_moves = game.get_legal_moves()
@@ -241,18 +241,20 @@ class MCTS:
 
             if cache is not None and cache_key in cache:
                 # 命中缓存：直接复用已计算的 policy/value
-                policy, value = cache[cache_key]
+                policy, value_for_current_player = cache[cache_key]
                 self._cache_hits += 1
             else:
                 # 先对非法走法 mask 再 softmax，数值更稳定
                 planes = game.to_planes()
-                policy, value = self.model.predict_with_mask(planes, legal_indices)
+                policy, value_for_current_player = self.model.predict_with_mask(
+                    planes, legal_indices)
                 # 将结果存入缓存（未超上限时）
                 if cache is not None and len(cache) < self.cache_size:
-                    cache[cache_key] = (policy, value)
+                    cache[cache_key] = (policy, value_for_current_player)
 
                 if self.debug_mcts:
-                    self._print_network_output(policy, value, legal_moves_flipped)
+                    self._print_network_output(
+                        policy, value_for_current_player, legal_moves_flipped)
 
             # 扩展节点
             total_prior = 0.0
@@ -272,13 +274,16 @@ class MCTS:
                 for child in node.children.values():
                     child.prior = uniform
 
-            value = -value  # 翻转值（父节点视角）
-
         # 回传
-        for i in range(len(path) - 1, -1, -1):
-            path[i].visit_count += 1
-            path[i].total_value += value
-            value = -value  # 交替翻转
+        # Q 值约定：node.total_value / node.visit_count 表示"选择该节点的那方玩家"
+        # 的视角价值（与 _select_child 直接最大化 child.q_value 的逻辑对应）。
+        # path[-1] 由其父节点选出，因此应存储父方视角 = -value_for_current_player；
+        # 之后每上升一层，双方交替，视角再翻转一次。
+        backprop_value = -value_for_current_player
+        for node in reversed(path):
+            node.visit_count += 1
+            node.total_value += backprop_value
+            backprop_value = -backprop_value
 
     def _print_network_output(self, policy, value, legal_moves_flipped):
         """打印神经网络预测输出（调试用）"""
