@@ -107,7 +107,7 @@ class ChessModel:
     处理模型的构建、保存、加载和预测。
     """
 
-    def __init__(self, num_channels=128, num_res_blocks=4):
+    def __init__(self, num_channels=256, num_res_blocks=16):
         self.device = get_device()
         self.num_channels = num_channels
         self.num_res_blocks = num_res_blocks
