@@ -661,7 +661,7 @@ def run_distill(
     os.makedirs(out_dir, exist_ok=True)
 
     # 初始化模型
-    model = ChessModel(num_channels=128, num_res_blocks=4)
+    model = ChessModel(num_channels=256, num_res_blocks=16)
     if model_path and os.path.exists(model_path):
         print(f"从已有权重继续蒸馏: {model_path}")
         model.load(model_path)
