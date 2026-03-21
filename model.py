@@ -48,12 +48,12 @@ class PolicyValueNet(nn.Module):
 
     简化版本：
     - 输入: 14x10x9
-    - 特征提取: 128通道, 4个残差块
+    - 特征提取: 256通道, 16个残差块
     - 策略头: 输出所有走法的概率
     - 价值头: 输出局面评估 [-1, 1]
     """
 
-    def __init__(self, num_channels=128, num_res_blocks=4):
+    def __init__(self, num_channels=256, num_res_blocks=16):
         super().__init__()
         self.num_channels = num_channels
         self.num_res_blocks = num_res_blocks
