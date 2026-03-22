@@ -177,47 +177,47 @@ def parse_multipv_info(info_lines: list) -> list:
         ``(uci_move: str, score_cp: int)``。
     """
     candidates: dict = {}
-    for line in info_lines:
+    
+    # 倒序遍历列表：从最新的 info 往回看
+    for line in reversed(info_lines):
         if 'multipv' not in line:
             continue
+            
         parts = line.split()
         try:
             multipv_rank = int(parts[parts.index('multipv') + 1])
         except (ValueError, IndexError):
             continue
 
+        # 如果这个排名的“最高深度”已经存过了，就跳过（因为我们是倒着看的）
+        if multipv_rank in candidates:
+            continue
+
+        # --- 以下是解析 score 和 pv 的逻辑（保持不变） ---
         score_cp = None
         try:
             if 'score' in parts:
                 score_idx = parts.index('score')
-                score_type = parts[score_idx + 1] if score_idx + 1 < len(parts) else None
-                score_val = parts[score_idx + 2] if score_idx + 2 < len(parts) else None
-                if score_type == 'cp' and score_val is not None:
+                score_type = parts[score_idx + 1]
+                score_val = parts[score_idx + 2]
+                if score_type == 'cp':
                     score_cp = int(score_val)
-                elif score_type == 'mate' and score_val is not None:
-                    n = int(score_val)
-                    score_cp = 10000 if n > 0 else -10000
-        except (ValueError, IndexError):
-            pass
+                elif score_type == 'mate':
+                    score_cp = 10000 if int(score_val) > 0 else -10000
+        except: pass
 
         pv_move = None
         try:
             if 'pv' in parts:
                 pv_idx = parts.index('pv')
-                if pv_idx + 1 < len(parts):
-                    pv_move = parts[pv_idx + 1]
-        except (ValueError, IndexError):
-            pass
+                pv_move = parts[pv_idx + 1]
+        except: pass
+        # ----------------------------------------------
 
         if score_cp is not None and pv_move is not None:
-            # Keep only the first entry per multipv rank; info lines are
-            # typically emitted in ascending depth order so the last entry
-            # at each rank would be the deepest — but since we need just one
-            # representative per rank, the first occurrence (lowest depth)
-            # is sufficient for soft-target construction.
-            if multipv_rank not in candidates:
-                candidates[multipv_rank] = (pv_move, score_cp)
+            candidates[multipv_rank] = (pv_move, score_cp)
 
+    # 返回按 rank 排序的结果
     return [candidates[k] for k in sorted(candidates.keys())]
 
 class PikafishAgent(BaseAgent):
