@@ -59,6 +59,7 @@ from .game import (
     flip_move, fen_to_planes,
 )
 from .model import ChessModel
+from .mcts import MCTS
 from .export import init_run_dir, append_self_play_jsonl, append_training_csv
 
 logger = logging.getLogger(__name__)
@@ -596,6 +597,8 @@ def run_distill(
     value_loss_weight: float = 0.0,
     buffer_size: int = 20000,
     save_interval: int = 20,
+    self_eval_games: int = 20,
+    self_eval_num_simulations: int = 50,
     engine_options: dict = None,
     teacher_engine_path: str = None,
     teacher_options: dict = None,
@@ -631,6 +634,8 @@ def run_distill(
         value_loss_weight:        价值损失权重（蒸馏阶段建议 0.0；默认 0.0）。
         buffer_size:              训练数据缓冲区大小（默认 20000）。
         save_interval:            每隔多少局保存一次模型（默认 20）。
+        self_eval_games:          每次增量保存后，与上一个快照自博弈评测局数（默认 20）。
+        self_eval_num_simulations: 自博弈评测每步 MCTS 模拟次数（默认 50）。
         engine_options:           传给弱引擎的选项字典（如 ``{"UCI_Elo": "1500"}``）。
         teacher_engine_path:      强引擎路径；若为 ``None`` 则复用弱引擎（unified 模式）。
         teacher_options:          传给强引擎的选项字典。
@@ -652,6 +657,7 @@ def run_distill(
 
     out_dir = os.path.dirname(out_model) if os.path.dirname(out_model) else '.'
     os.makedirs(out_dir, exist_ok=True)
+    self_play_history_csv = os.path.join(out_dir, 'self_play_history.csv')
 
     # 初始化模型
     model = ChessModel(num_channels=256, num_res_blocks=16)
@@ -704,6 +710,88 @@ def run_distill(
     strong_opts = teacher_options or {}
 
     def _run_games(weak_agent, teacher_agent):
+        previous_model_path = None
+
+        def _run_self_eval(current_path: str, previous_path: str):
+            """当前增量模型与上一个增量模型做自博弈评测，并落盘 CSV。"""
+            current_model = ChessModel(num_channels=256, num_res_blocks=16)
+            previous_model = ChessModel(num_channels=256, num_res_blocks=16)
+            current_model.load(current_path)
+            previous_model.load(previous_path)
+
+            wins_current = 0
+            losses_current = 0
+            draws = 0
+            total_moves = 0
+
+            for eval_game_idx in range(self_eval_games):
+                if eval_game_idx % 2 == 0:
+                    red_model = current_model
+                    black_model = previous_model
+                    current_is_red = True
+                else:
+                    red_model = previous_model
+                    black_model = current_model
+                    current_is_red = False
+
+                game = ChessGame()
+                game.reset()
+                red_mcts = MCTS(red_model, num_simulations=self_eval_num_simulations)
+                black_mcts = MCTS(black_model, num_simulations=self_eval_num_simulations)
+
+                move_count = 0
+                while not game.done and move_count < max_moves:
+                    mcts = red_mcts if game.red_to_move else black_mcts
+                    actions, probs = mcts.get_action_probs(
+                        game, temperature=0.0, add_noise=False
+                    )
+                    if not actions:
+                        break
+
+                    chosen_action = actions[int(np.argmax(probs))]
+                    actual_action = chosen_action if game.red_to_move else flip_move(chosen_action)
+                    game.step(actual_action)
+                    mcts.update_with_move(chosen_action)
+                    move_count += 1
+
+                winner = game.winner
+                total_moves += move_count
+                if winner == 'draw' or winner is None:
+                    draws += 1
+                elif (winner == 'red' and current_is_red) or (
+                    winner == 'black' and not current_is_red
+                ):
+                    wins_current += 1
+                else:
+                    losses_current += 1
+
+            avg_moves = total_moves / max(self_eval_games, 1)
+            row = {
+                'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+                'game_idx': game_idx,
+                'current_model': os.path.basename(current_path),
+                'previous_model': os.path.basename(previous_path),
+                'n_games': self_eval_games,
+                'wins': wins_current,
+                'losses': losses_current,
+                'draws': draws,
+                'avg_moves': round(avg_moves, 3),
+                'num_simulations': self_eval_num_simulations,
+            }
+            file_exists = os.path.exists(self_play_history_csv)
+            with open(self_play_history_csv, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
+
+            print(
+                f"  自博弈评测完成: {os.path.basename(current_path)} vs "
+                f"{os.path.basename(previous_path)} | "
+                f"W/L/D={wins_current}/{losses_current}/{draws}, "
+                f"avg_moves={avg_moves:.2f}"
+            )
+
         for game_idx in range(1, n_games + 1):
             start_time = time.time()
 
@@ -800,8 +888,14 @@ def run_distill(
                 })
 
             if game_idx % save_interval == 0:
-                model.save(out_model)
-                print(f"  蒸馏模型已保存到: {out_model}")
+                incremental_model_path = os.path.join(
+                    out_dir, f"model_distill_{game_idx}.pth"
+                )
+                model.save(incremental_model_path)
+                print(f"  蒸馏模型已增量保存到: {incremental_model_path}")
+                if previous_model_path and self_eval_games > 0:
+                    _run_self_eval(incremental_model_path, previous_model_path)
+                previous_model_path = incremental_model_path
 
     use_separate_teacher = (
         teacher_engine_path is not None
@@ -833,6 +927,7 @@ def run_distill(
           f"黑方胜: {stats['black_wins']}, "
           f"和棋: {stats['draws']}")
     print(f"蒸馏模型已保存到: {out_model}")
+    print(f"历史自博弈评测 CSV: {self_play_history_csv}")
     print(f"日志目录: {run_dir}")
     print(f"{'='*60}")
     print(f"\n下一步：RL 微调（阶段 B）")
@@ -907,6 +1002,10 @@ def main():
                         help='训练数据缓冲区大小 (默认: 20000)')
     parser.add_argument('--save_interval', type=int, default=20,
                         help='每隔多少局保存一次模型 (默认: 20)')
+    parser.add_argument('--self_eval_games', type=int, default=20,
+                        help='每次增量保存后，与上一快照自博弈评测局数（0=禁用，默认: 20）')
+    parser.add_argument('--self_eval_num_simulations', type=int, default=50,
+                        help='自博弈评测每步 MCTS 模拟次数（默认: 50）')
 
     # 【原有参数】支持 Elo 控制
     parser.add_argument('--engine_elo', type=int, default=None,
@@ -987,6 +1086,8 @@ def main():
         value_loss_weight=args.value_loss_weight,
         buffer_size=args.buffer_size,
         save_interval=args.save_interval,
+        self_eval_games=args.self_eval_games,
+        self_eval_num_simulations=args.self_eval_num_simulations,
         teacher_engine_path=args.teacher_engine_path,
         multipv_k=args.multipv_k,
         teacher_temperature=args.teacher_temperature,
