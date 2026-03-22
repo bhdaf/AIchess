@@ -614,10 +614,6 @@ def run_distill(
     teacher_fallback_temperature: float = 0.6,
     # --- 新增：value_target 监督模式 ---
     distill_value_mode: str = "game_outcome",
-    # --- 新增：蒸馏评测闭环 ---
-    eval_every_n_games: int = 200,
-    eval_n_games: int = 20,
-    eval_elo_list: str = "500,800",
 ):
     """
     运行完整的蒸馏流程（阶段 A）。
@@ -650,9 +646,6 @@ def run_distill(
         teacher_fallback_topk:    fallback_topk_sharpen 保留 top 数量（默认 3）。
         teacher_fallback_temperature: fallback_topk_sharpen 温度（默认 0.6）。
         distill_value_mode:       value 监督模式："zero"/"game_outcome"（默认 "game_outcome"）。
-        eval_every_n_games:       每隔多少局触发一次快速评测（默认 200；0=禁用）。
-        eval_n_games:             每次评测局数（默认 20）。
-        eval_elo_list:            评测用 Elo 列表（逗号分隔，默认 "500,800"）。
     """
     from collections import deque
     from .pikafish_agent import PikafishAgent
@@ -693,9 +686,6 @@ def run_distill(
     run_dir = init_run_dir(config=distill_config)
     print(f"蒸馏日志目录: {run_dir}")
 
-    # 评测结果 CSV 路径
-    eval_csv_path = os.path.join(run_dir, 'distill_eval_metrics.csv')
-
     data_buffer = deque(maxlen=buffer_size)
     stats = {'red_wins': 0, 'black_wins': 0, 'draws': 0}
 
@@ -712,32 +702,6 @@ def run_distill(
 
     weak_opts = engine_options or {}
     strong_opts = teacher_options or {}
-
-    def _run_eval_vs_engine(eval_engine_path, elo, n):
-        """调用 vs_pikafish 进行快速对战评测，返回统计字典。"""
-        from .vs_pikafish import run_games as _run_vs
-        try:
-            result = _run_vs(
-                model=model,
-                engine_path=eval_engine_path,
-                n_games=n,
-                engine_options={'UCI_Elo': str(elo), 'UCI_LimitStrength': 'true'},
-                ai_side='both',
-                verbose=False,
-            )
-            return result
-        except Exception as exc:
-            logger.warning("评测失败（Elo=%s）: %s", elo, exc)
-            return None
-
-    def _append_eval_csv(record):
-        """追加评测记录到 distill_eval_metrics.csv。"""
-        file_exists = os.path.exists(eval_csv_path)
-        with open(eval_csv_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=list(record.keys()))
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(record)
 
     def _run_games(weak_agent, teacher_agent):
         for game_idx in range(1, n_games + 1):
@@ -838,36 +802,6 @@ def run_distill(
             if game_idx % save_interval == 0:
                 model.save(out_model)
                 print(f"  蒸馏模型已保存到: {out_model}")
-
-            # --- 蒸馏评测闭环 ---
-            if (eval_every_n_games > 0
-                    and engine_path
-                    and game_idx % eval_every_n_games == 0):
-                model.save(out_model)
-                elo_values = [
-                    int(x.strip()) for x in eval_elo_list.split(',')
-                    if x.strip().isdigit()
-                ]
-                for elo in elo_values:
-                    print(f"  [评测] vs Pikafish Elo={elo}，{eval_n_games} 局...")
-                    result = _run_eval_vs_engine(engine_path, elo, eval_n_games)
-                    if result is not None:
-                        print(f"    胜: {result.get('wins',0)}, "
-                              f"负: {result.get('losses',0)}, "
-                              f"和: {result.get('draws',0)}, "
-                              f"均步: {result.get('avg_moves',0):.1f}")
-                        _append_eval_csv({
-                            'game_idx': game_idx,
-                            'timestamp': datetime.datetime.now().isoformat(
-                                timespec='seconds'),
-                            'eval_elo': elo,
-                            'eval_n_games': eval_n_games,
-                            'wins': result.get('wins', 0),
-                            'losses': result.get('losses', 0),
-                            'draws': result.get('draws', 0),
-                            'avg_moves': round(result.get('avg_moves', 0), 1),
-                            'model_path': out_model,
-                        })
 
     use_separate_teacher = (
         teacher_engine_path is not None
@@ -1018,14 +952,6 @@ def main():
                         help='value 监督模式：zero=固定 0（原有行为），'
                              'game_outcome=按终局结果回填（红胜+1，黑胜-1，和0，默认）')
 
-    # 4) 蒸馏评测闭环
-    parser.add_argument('--eval_every_n_games', type=int, default=200,
-                        help='每隔多少局触发一次快速评测（0=禁用，默认: 200）')
-    parser.add_argument('--eval_n_games', type=int, default=20,
-                        help='每次评测局数（默认: 20）')
-    parser.add_argument('--eval_elo_list', type=str, default='500,800',
-                        help='评测用 Pikafish Elo 列表（逗号分隔，默认: "500,800"）')
-
     args = parser.parse_args()
 
     # 解析自定义 options 为字典
@@ -1076,9 +1002,6 @@ def main():
         teacher_fallback_topk=args.teacher_fallback_topk,
         teacher_fallback_temperature=args.teacher_fallback_temperature,
         distill_value_mode=args.distill_value_mode,
-        eval_every_n_games=args.eval_every_n_games,
-        eval_n_games=args.eval_n_games,
-        eval_elo_list=args.eval_elo_list,
     )
 
 
