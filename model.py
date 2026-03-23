@@ -47,7 +47,7 @@ class PolicyValueNet(nn.Module):
     策略价值网络
 
     简化版本：
-    - 输入: 14x10x9
+    - 输入: 16x10x9
     - 特征提取: 256通道, 16个残差块
     - 策略头: 输出所有走法的概率
     - 价值头: 输出局面评估 [-1, 1]
@@ -59,7 +59,7 @@ class PolicyValueNet(nn.Module):
         self.num_res_blocks = num_res_blocks
 
         # 初始卷积
-        self.input_conv = nn.Conv2d(14, num_channels, 3, padding=1, bias=False)
+        self.input_conv = nn.Conv2d(16, num_channels, 3, padding=1, bias=False)
         self.input_bn = nn.BatchNorm2d(num_channels)
 
         # 残差块
@@ -160,7 +160,7 @@ class ChessModel:
         预测走法概率和局面评估
 
         Args:
-            planes: numpy array, shape (14, 10, 9) 或 (batch, 14, 10, 9)
+            planes: numpy array, shape (16, 10, 9) 或 (batch, 16, 10, 9)
 
         Returns:
             policy: numpy array, shape (NUM_ACTIONS,)，所有走法的概率分布（和为1）
@@ -183,7 +183,7 @@ class ChessModel:
         尤其在合法走法概率很小时效果更稳定。
 
         Args:
-            planes: numpy array, shape (14, 10, 9)
+            planes: numpy array, shape (16, 10, 9) 或 (batch, 16, 10, 9)
             legal_indices: list[int]，合法走法在策略向量中的索引
 
         Returns:

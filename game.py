@@ -935,13 +935,48 @@ class ChessGame:
 
     def to_planes(self):
         """
-        将棋盘转换为14通道的特征平面（当前玩家视角）
-
+        将棋盘转换为16通道特征平面
+        
+        通道结构:
+        - 0-13: 棋子位置 (原有)
+        - 14: 走子方标记 (红方=1, 黑方=0)
+        - 15: 步数标记 (归一化, 用于判断开局/残局)
+        
         Returns:
-            numpy array, shape (14, 10, 9)
+            numpy array, shape (16, 10, 9)
         """
+        # 1. 获取当前视角的 FEN (如果是黑方，get_observation 已经翻转了棋盘)
         fen = self.get_observation()
-        return fen_to_planes(fen)
+        
+        # 2. 初始化 16 通道平面
+        planes = np.zeros((16, BOARD_HEIGHT, BOARD_WIDTH), dtype=np.float32)
+        
+        # 3. 填充前 14 通道 (棋子位置)
+        rows = fen.split('/')
+        for y in range(len(rows)):
+            x = 0
+            for ch in rows[y]:
+                if ch.isdigit():
+                    x += int(ch)
+                elif ch.isalpha():
+                    # 计算 Piece Index
+                    idx = PIECE_TO_INDEX[ch] + (7 if ch.islower() else 0)
+                    planes[idx][y][x] = 1
+                    x += 1
+        
+        # 4. 填充第 15 通道 (走子方)
+        # 因为 get_observation 已经翻转了视角，模型看到的永远是"红方(自己)在下方"。
+        # 但我们需要告诉模型：实际上现在是谁走？
+        # 如果当前是红方走，填 1；黑方走，填 0。
+        if self.red_to_move:
+            planes[14, :, :] = 1.0
+            
+        # 5. 填充第 16 通道 (步数/回合数)
+        # 归一化：除以 200.0 (假设一局棋通常 200 步以内)
+        # 这有助于模型区分开局(0.0)、中局(0.5)和残局(1.0+)
+        planes[15, :, :] = self.num_moves / 200.0
+
+        return planes
 
     def print_board(self):
         """打印棋盘到控制台"""
@@ -955,17 +990,11 @@ class ChessGame:
         print()
 
 
-def fen_to_planes(fen):
+def fen_to_planes(fen, red_to_move=True, num_moves=0):
     """
-    将FEN字符串转换为14通道特征平面
-
-    Args:
-        fen: FEN格式的棋盘字符串
-
-    Returns:
-        numpy array, shape (14, 10, 9)
+    将FEN字符串转换为16通道特征平面 (外部调用接口)
     """
-    planes = np.zeros((14, BOARD_HEIGHT, BOARD_WIDTH), dtype=np.float32)
+    planes = np.zeros((16, BOARD_HEIGHT, BOARD_WIDTH), dtype=np.float32)
     rows = fen.split('/')
     for y in range(len(rows)):
         x = 0
@@ -976,4 +1005,10 @@ def fen_to_planes(fen):
                 idx = PIECE_TO_INDEX[ch] + (7 if ch.islower() else 0)
                 planes[idx][y][x] = 1
                 x += 1
+    
+    # 填充扩展通道
+    if red_to_move:
+        planes[14, :, :] = 1.0
+    planes[15, :, :] = num_moves / 200.0
+    
     return planes
