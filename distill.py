@@ -429,6 +429,14 @@ def generate_distill_game(
         if len(recent_moves) > anti_repetition_window:
             recent_moves = recent_moves[-anti_repetition_window:]
 
+        if value_target is None:
+            # 如果经过所有努力 Value 仍为 None，设为 0 或跳过
+            # 这里建议跳过，以免训练错误的 Value
+            logger.warning("Value 标签缺失，跳过本步样本")
+            game.step(actual_move)
+            move_count += 1
+            continue
+
         # Soft fallback: ask teacher for its best move, build peaked distribution
         if policy is None:
             best_mv = teacher_suggested_move
@@ -446,14 +454,6 @@ def generate_distill_game(
             logger.warning(
                 "教师策略构建失败（走法: %r），跳过本步样本", actual_move
             )
-            game.step(actual_move)
-            move_count += 1
-            continue
-
-        if value_target is None:
-            # 如果经过所有努力 Value 仍为 None，设为 0 或跳过
-            # 这里建议跳过，以免训练错误的 Value
-            logger.warning("Value 标签缺失，跳过本步样本")
             game.step(actual_move)
             move_count += 1
             continue
