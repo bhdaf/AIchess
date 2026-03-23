@@ -355,21 +355,49 @@ def generate_distill_game(
             break
 
         is_black = not game.red_to_move
-        # 当前局面的 player_sign：红方 = +1，黑方 = -1
-        player_sign = -1 if is_black else 1
+        # ------------------------------------------------------------------
+        # 1. Teacher: 单次搜索获取 (Policy, Value, Move)
+        # ------------------------------------------------------------------
+        policy = None
+        value_target = None  # 初始化为 None，强制显式赋值
+        teacher_suggested_move = None # 缓存 Teacher 搜索出的最佳走法
+
+        if hasattr(_teacher, 'get_policy_and_value'):
+            try:
+                # 一次调用获取全部信息
+                policy, score_red_view, teacher_suggested_move = _teacher.get_policy_and_value(
+                    game, k=multipv_k, temperature=teacher_temperature
+                )
+                
+                # 计算 Value 标签
+                if score_red_view is not None:
+                    val = math.tanh(score_red_view / 300.0)
+                    # 处理黑方视角翻转
+                    if is_black:
+                        val = -val
+                    value_target = val
+                    
+            except Exception as exc:
+                logger.warning("get_policy_and_value 失败: %s", exc)
+                policy = None
 
         # ------------------------------------------------------------------
-        # 1. 决定本步实际走子方（轨迹来源）
+        # 2. 决定实际走子 (轨迹来源)
         # ------------------------------------------------------------------
         use_teacher_move = False
         if trajectory_source == 'teacher':
             use_teacher_move = True
         elif trajectory_source == 'mixed':
             use_teacher_move = random.random() < mixed_teacher_ratio
-        # else "weak": use_teacher_move = False
 
         if use_teacher_move:
-            actual_move = _teacher.get_move(game)
+            # 优化：直接使用上一步缓存的最佳走法，避免重复搜索
+            actual_move = teacher_suggested_move
+            
+            # 如果上面搜索失败(actual_move为None)，才退化调用 get_move
+            if actual_move is None:
+                actual_move = _teacher.get_move(game)
+                
             if actual_move is None:
                 actual_move = random.choice(legal)
                 logger.warning("teacher 未返回走法，改用随机走法: %s", actual_move)
@@ -381,6 +409,7 @@ def generate_distill_game(
                 logger.warning("弱引擎未返回走法，改用随机走法: %s", actual_move)
 
         total_move_count += 1
+
 
         # Anti-repetition: if this move appeared ≥2 times in recent window,
         # substitute with a random alternative to escape back-and-forth loops.
@@ -400,28 +429,15 @@ def generate_distill_game(
         if len(recent_moves) > anti_repetition_window:
             recent_moves = recent_moves[-anti_repetition_window:]
 
-        # ------------------------------------------------------------------
-        # 2. Teacher: produce soft policy for the current position
-        # ------------------------------------------------------------------
-        policy: "np.ndarray | None" = None
-
-        # Try MultiPV-based soft policy (PikafishAgent with get_soft_policy)
-        if hasattr(_teacher, 'get_soft_policy'):
-            try:
-                policy = _teacher.get_soft_policy(
-                    game, k=multipv_k, temperature=teacher_temperature,
-                )
-            except Exception as exc:
-                logger.warning("get_soft_policy 失败，回退到软标注策略: %s", exc)
-                policy = None
-
         # Soft fallback: ask teacher for its best move, build peaked distribution
         if policy is None:
-            teacher_move = _teacher.get_move(game)
-            if teacher_move is None:
-                teacher_move = actual_move  # last resort
+            best_mv = teacher_suggested_move
+            if best_mv is None:
+                best_mv = _teacher.get_move(game)
+            if best_mv is None: 
+                best_mv = actual_move
             policy = _build_soft_policy_fallback(
-                teacher_move, legal, is_black,
+                best_mv, legal, is_black,
             )
 
         if policy is None:
@@ -430,6 +446,14 @@ def generate_distill_game(
             logger.warning(
                 "教师策略构建失败（走法: %r），跳过本步样本", actual_move
             )
+            game.step(actual_move)
+            move_count += 1
+            continue
+
+        if value_target is None:
+            # 如果经过所有努力 Value 仍为 None，设为 0 或跳过
+            # 这里建议跳过，以免训练错误的 Value
+            logger.warning("Value 标签缺失，跳过本步样本")
             game.step(actual_move)
             move_count += 1
             continue
@@ -456,13 +480,10 @@ def generate_distill_game(
         )
         if not quality_ok:
             low_quality_count += 1
-            # 取 teacher best move 用于 fallback
-            teacher_bm = actual_move  # 默认使用实际走法
-            if hasattr(_teacher, 'get_move'):
-                _bm = _teacher.get_move(game)
-                if _bm is not None:
-                    teacher_bm = _bm
-
+            # 使用实际走法进行兜底
+            teacher_bm = actual_move
+            # 注意：这里不需要再次调用 get_move，因为 actual_move 已经是确定好的
+            
             policy = _apply_policy_quality_fallback(
                 policy, teacher_bm, legal, is_black,
                 teacher_low_quality_action,
@@ -470,37 +491,18 @@ def generate_distill_game(
                 teacher_fallback_temperature,
             )
             if policy is None:
-                # skip_sample 模式：跳过本样本，对局继续
                 skip_sample_count += 1
                 game.step(actual_move)
                 move_count += 1
                 continue
 
-        # 暂时以 0.0 占位，终局后按 distill_value_mode 回填
-        raw_data.append((state_planes, policy, player_sign))
+        # 存储数据
+        raw_data.append((state_planes, policy, value_target))
 
         game.step(actual_move)
         move_count += 1
 
-    # ------------------------------------------------------------------
-    # 4. 终局后回填 value_target
-    # ------------------------------------------------------------------
-    if distill_value_mode == 'game_outcome':
-        if game.winner == 'red':
-            game_outcome = 1.0
-        elif game.winner == 'black':
-            game_outcome = -1.0
-        else:
-            game_outcome = 0.0
-        # value_target 对当前局面的走棋方：红方视角 = game_outcome * (+1)
-        # 黑方视角（已 flip 到红方坐标空间）= game_outcome * (-1)
-        training_data = [
-            (s, p, float(game_outcome * player_sign))
-            for s, p, player_sign in raw_data
-        ]
-    else:
-        # "zero" 模式：与原有行为兼容
-        training_data = [(s, p, 0.0) for s, p, _ in raw_data]
+    training_data = [(s, p, v) for s, p, v in raw_data]
 
     game_stats = {
         'teacher_move_count': teacher_move_count,
@@ -533,7 +535,7 @@ def distill_model(model, training_data, batch_size: int = 256,
         avg_loss (float): 平均总损失。
     """
     if not training_data:
-        return 0.0
+        return 0.0, 0.0  # 修改1：返回两个0.0
 
     states = np.array([d[0] for d in training_data])
     policies = np.array([d[1] for d in training_data])
@@ -550,6 +552,8 @@ def distill_model(model, training_data, batch_size: int = 256,
     optimizer = optim.Adam(model.model.parameters(), lr=lr, weight_decay=1e-4)
 
     total_loss = 0.0
+    total_policy_loss = 0.0  # 新增：累计策略损失
+    total_value_loss = 0.0   # 新增：累计价值损失
     num_batches = 0
 
     for _epoch in range(epochs):
@@ -560,17 +564,17 @@ def distill_model(model, training_data, batch_size: int = 256,
 
             pred_logits, pred_values = model.model(batch_states)
 
-            # 策略损失：交叉熵（soft target 通用形式）
-            # CE = -mean(sum(target * log_softmax(logits)))
-            # 同时适用于 one-hot 和 soft label；soft label 使 KL 散度最小化。
+            # 策略损失
             policy_loss = -torch.mean(
                 torch.sum(
                     batch_policies * torch.nn.functional.log_softmax(pred_logits, dim=1),
                     dim=1,
                 )
             )
-            # 价值损失（蒸馏阶段权重 = 0，不更新价值头）
+            # 价值损失
             value_loss = torch.mean((batch_values - pred_values.squeeze()) ** 2)
+            
+            # 总损失
             loss = policy_loss + value_loss_weight * value_loss
 
             optimizer.zero_grad()
@@ -579,10 +583,14 @@ def distill_model(model, training_data, batch_size: int = 256,
             optimizer.step()
 
             total_loss += loss.item()
+            total_policy_loss += policy_loss.item() # 新增：记录
+            total_value_loss += value_loss.item()   # 新增：记录
             num_batches += 1
 
     model.model.eval()
-    return total_loss / max(num_batches, 1)
+    # 修改2：返回平均策略损失和平均价值损失
+    return (total_policy_loss / max(num_batches, 1), 
+            total_value_loss / max(num_batches, 1))
 
 
 def run_distill(
@@ -859,21 +867,23 @@ def run_distill(
             }
             append_self_play_jsonl(run_dir, jsonl_record)
 
-            avg_loss = 0.0
+            avg_policy_loss = 0.0
+            avg_value_loss = 0.0
             if len(data_buffer) >= batch_size:
-                avg_loss = distill_model(
+                avg_policy_loss, avg_value_loss = distill_model(
                     model, list(data_buffer),
                     batch_size=batch_size,
                     epochs=epochs,
                     lr=lr,
                     value_loss_weight=value_loss_weight,
                 )
-                print(f"  蒸馏训练完成，平均策略损失: {avg_loss:.4f}")
+                print(f"  蒸馏训练完成，平均策略损失: {avg_policy_loss:.4f}，平均价值损失: {avg_value_loss:.4f}")
 
                 append_training_csv(run_dir, {
                     'game_idx': game_idx,
                     'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
-                    'loss': round(avg_loss, 6),
+                    'policy_loss': round(avg_policy_loss, 6),
+                    'value_loss': round(avg_value_loss, 6),
                     'buffer_size': len(data_buffer),
                     'elapsed_s': round(elapsed, 2),
                     'mode': 'distill',

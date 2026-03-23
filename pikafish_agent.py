@@ -405,69 +405,78 @@ class PikafishAgent(BaseAgent):
 
         return internal_move, info_lines
 
-    def get_soft_policy(self, game, k: int = 5,
-                        temperature: float = 1.0) -> "np.ndarray | None":
-        """
-        使用 MultiPV 搜索为当前局面构造 soft policy 概率分布。
+    def get_policy_and_value(self, game, k: int = 5,
+            temperature: float = 1.0) -> "tuple[np.ndarray, float, str] | tuple[None, None, None]":
+            """
+            单次搜索同时获取 Soft Policy, Value Score 和 Best Move。
+            
+            Returns:
+                (policy, value, best_move_internal): 
+                    policy: np.ndarray (NUM_ACTIONS,), sum≈1。
+                    value: float, 红方视角分数。
+                    best_move_internal: str, 内部格式的最佳走法 (如 "7072")。
+                如果失败，返回 None。
+            """
+            from .game import NUM_ACTIONS, LABEL_TO_INDEX, flip_move
 
-        该方法会利用引擎在搜索时输出的 ``info multipv`` 行，提取 top-k 候选
-        走法及其评分，通过带温度的 softmax 转换为概率分布。
+            # 1. 设置 MultiPV 并执行一次搜索
+            actual_k = max(k, self.multipv)
+            if actual_k != self.multipv:
+                self._engine.set_option("MultiPV", str(actual_k))
 
-        This method temporarily changes the engine's ``MultiPV`` option and is
-        **not thread-safe**. Do not call it concurrently from multiple threads
-        on the same ``PikafishAgent`` instance.
+            # _move 这里是 UCI 格式的最佳走法
+            best_move_uci, info_lines = self.get_move_with_info(game)
 
-        Args:
-            game:        :class:`~AIchess.game.ChessGame` 实例（当前局面）。
-            k:           MultiPV 候选数量（默认 5）；实际数量受引擎支持上限约束。
-            temperature: 分数温度（越高分布越平，越低越尖锐）；默认 1.0。
+            if actual_k != self.multipv:
+                self._engine.set_option("MultiPV", str(self.multipv))
 
-        Returns:
-            ``np.ndarray`` of shape ``(NUM_ACTIONS,)``，float32，sum ≈ 1；
-            或在无有效候选时返回 ``None``。
-        """
-        from .game import NUM_ACTIONS, LABEL_TO_INDEX, flip_move
+            candidates = parse_multipv_info(info_lines)
+            if not candidates:
+                return None, None, None
 
-        # 若当前设置的 MultiPV < k，临时提升；搜索后恢复
-        actual_k = max(k, self.multipv)
-        if actual_k != self.multipv:
-            self._engine.set_option("MultiPV", str(actual_k))
-
-        _move, info_lines = self.get_move_with_info(game)
-
-        if actual_k != self.multipv:
-            self._engine.set_option("MultiPV", str(self.multipv))
-
-        candidates = parse_multipv_info(info_lines)
-        if not candidates:
-            return None
-
-        is_black = not game.red_to_move
-        policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
-        indices = []
-        scores = []
-
-        for uci_mv, score_cp in candidates:
+            # 2. 提取最佳走法 并转换为内部格式
+            best_move_internal = None
             try:
-                internal_mv = uci_to_internal(uci_mv)
+                if best_move_uci:
+                    best_move_internal = uci_to_internal(best_move_uci)
             except ValueError:
-                continue
-            policy_mv = flip_move(internal_mv) if is_black else internal_mv
-            if policy_mv not in LABEL_TO_INDEX:
-                continue
-            indices.append(LABEL_TO_INDEX[policy_mv])
-            scores.append(float(score_cp))
+                pass
+            
+            # 3. 提取价值分数
+            _, score_cp = candidates[0]
+            is_black = not game.red_to_move
+            value_red_view = -float(score_cp) if is_black else float(score_cp)
 
-        if not indices:
-            return None
+            # 4. 构建 Soft Policy
+            policy = np.zeros(NUM_ACTIONS, dtype=np.float32)
+            indices = []
+            scores = []
 
-        # Softmax with temperature (centipawns / 100 / T)
-        arr = np.array(scores, dtype=np.float64) / 100.0 / max(temperature, 1e-6)
-        arr -= arr.max()  # numerical stability
-        probs = np.exp(arr)
-        probs /= probs.sum()
+            for uci_mv, score_cp_iter in candidates:
+                try:
+                    internal_mv = uci_to_internal(uci_mv)
+                except ValueError:
+                    continue
+                
+                policy_mv = flip_move(internal_mv) if is_black else internal_mv
+                if policy_mv not in LABEL_TO_INDEX:
+                    continue
+                
+                indices.append(LABEL_TO_INDEX[policy_mv])
+                scores.append(float(score_cp_iter))
 
-        for idx, prob in zip(indices, probs):
-            policy[idx] += float(prob)
+            if not indices:
+                # 如果策略构建失败，但走法和分数是有的，仍然可以返回（或者选择全返回None）
+                # 这里为了安全，返回 None
+                return None, value_red_view, best_move_internal
 
-        return policy
+            # Softmax 计算概率
+            arr = np.array(scores, dtype=np.float64) / 100.0 / max(temperature, 1e-6)
+            arr -= arr.max()
+            probs = np.exp(arr)
+            probs /= probs.sum()
+
+            for idx, prob in zip(indices, probs):
+                policy[idx] += float(prob)
+
+            return policy, value_red_view, best_move_internal
