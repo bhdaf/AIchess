@@ -145,9 +145,9 @@ def main():
                         help="蒸馏出来的模型权重路径 (例如 saved_model/model_distill.pth)")
     parser.add_argument('--n_games', type=int, default=20, 
                         help="对局总数 (默认: 20)")
-    parser.add_argument('--num_simulations', type=int, default=50, 
+    parser.add_argument('--num_simulations', type=int, default=100, 
                         help="MCTS 模拟次数 (默认: 50，对付随机模型不需要太高)")
-    parser.add_argument('--max_moves', type=int, default=200, 
+    parser.add_argument('--max_moves', type=int, default=300, 
                         help="一局的最大步数限制 (默认: 200)")
     parser.add_argument('--save_dir', type=str, default=None,
                         help="（可选）保存详细对局过程的文件夹路径，例如 logs/vs_random")

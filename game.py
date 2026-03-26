@@ -801,12 +801,28 @@ class ChessGame:
             - done: 游戏是否结束
             - info: {'reason': terminate_reason, 'winner': winner}
         """
+        if not isinstance(action, str) or len(action) != 4 or not action.isdigit():
+            raise ValueError(f"Invalid action format: {action!r}")
+
         x0, y0 = int(action[0]), int(action[1])
         x1, y1 = int(action[2]), int(action[3])
 
+        if not (0 <= x0 < BOARD_WIDTH and 0 <= x1 < BOARD_WIDTH and
+                0 <= y0 < BOARD_HEIGHT and 0 <= y1 < BOARD_HEIGHT):
+            raise ValueError(f"Action out of board range: {action}")
+
         # 增量更新哈希：移除起始位置棋子
         piece_moving = self.board[y0][x0]
+        if piece_moving is None:
+            raise ValueError(f"Illegal move from empty square: {action}")
+        if not self.is_own_piece(piece_moving):
+            raise ValueError(f"Illegal move for side-to-move: {action}")
+
         captured = self.board[y1][x1]
+        if captured is not None:
+            if (self.red_to_move and captured.isupper()) or \
+               ((not self.red_to_move) and captured.islower()):
+                raise ValueError(f"Illegal self-capture: {action}")
 
         if piece_moving is not None:
             self.pos_hash ^= self._zobrist_piece(piece_moving, x0, y0)

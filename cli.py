@@ -105,12 +105,16 @@ def main():
                 print(f"非法走法！合法走法示例: {legal_moves[:5]}")
                 continue
 
+            red_before = game.red_to_move
             game.step(move)
-            mcts.update_with_move(move)
+            mcts_move = move if red_before else flip_move(move)
+            mcts.update_with_move(mcts_move)
             print(f"你走了: {move}")
         else:
             print("AI思考中...")
-            actions, probs = mcts.get_action_probs(game, temperature=0.1)
+            actions, probs = mcts.get_action_probs(
+                game, temperature=0.1, reset_root=False
+            )
 
             if not actions:
                 print("AI无合法走法")

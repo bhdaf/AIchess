@@ -268,7 +268,11 @@ class ChessGUI:
 
     def _make_human_move(self, move):
         """执行人类走法"""
+        red_before = self.game.red_to_move
         self.game.step(move)
+        # MCTS内部动作统一使用“当前轮到红方视角”坐标
+        mcts_move = move if red_before else flip_move(move)
+        self.mcts.update_with_move(mcts_move)
         self.last_move = move
         self.selected = None
         self.legal_targets = []
@@ -289,7 +293,7 @@ class ChessGUI:
         """AI走法线程"""
         try:
             actions, probs = self.mcts.get_action_probs(
-                self.game, temperature=0.1
+                self.game, temperature=0.1, reset_root=False
             )
 
             if not actions:
