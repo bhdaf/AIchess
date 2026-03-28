@@ -175,6 +175,9 @@ def play_one_game(
 
         _, _, done, _ = game.step(move)
 
+        mcts_move = move if red_to_move else flip_move(move)
+        ai_agent._mcts.update_with_move(mcts_move)
+
         if verbose and done:
             game.print_board()
 
