@@ -152,7 +152,8 @@ def evaluate_models(model_a, model_b, n_games=20, num_simulations=50, max_moves=
             chosen_action = actions[int(np.argmax(probs))]
             actual_action = chosen_action if game.red_to_move else flip_move(chosen_action)
             game.step(actual_action)
-            mcts.update_with_move(chosen_action)
+            mcts_red.update_with_move(chosen_action)
+            mcts_black.update_with_move(chosen_action)
             move_count += 1
 
         winner = game.winner
