@@ -913,7 +913,11 @@ def compute_elo_update(r_current, r_opponent, score, k=32):
 
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
+<<<<<<< HEAD
                  buffer_size=50000, model_path=None, save_interval=50,
+=======
+                 buffer_size=10000, model_path=None, save_interval=50,
+>>>>>>> a144424e8099ff5d2917bea50fa9ac95ce7c6150
                  quick=False,
                  eval_interval=0, eval_games=40, eval_simulations=50,
                  eval_opponent='previous', elo_k=32,

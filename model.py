@@ -183,7 +183,7 @@ class ChessModel:
         尤其在合法走法概率很小时效果更稳定。
 
         Args:
-            planes: numpy array, shape (16, 10, 9)
+            planes: numpy array, shape (14, 10, 9)
             legal_indices: list[int]，合法走法在策略向量中的索引
 
         Returns:

@@ -57,7 +57,7 @@ class MCTS:
     """
 
     def __init__(self, model, num_simulations=200, c_puct=1.5,
-                 dirichlet_alpha=0.15, dirichlet_weight=0.25, cache_size=0,
+                 dirichlet_alpha=0.15, dirichlet_weight=0.25, cache_size=100000,
                  debug_mcts: bool = False):
         self.model = model
         self.num_simulations = num_simulations
@@ -70,7 +70,7 @@ class MCTS:
         self._cache_hits = 0  # 当次搜索命中次数（供日志统计）
 
     def get_action_probs(self, game, temperature=1.0, add_noise=False,
-                         reset_root=True, mode: Optional[str] = None):
+                         reset_root=False, mode: Optional[str] = None):
         """
         运行MCTS搜索并返回走法概率分布
 
@@ -78,7 +78,7 @@ class MCTS:
             game: ChessGame实例
             temperature: 温度参数，控制探索程度
             add_noise: 是否添加Dirichlet噪声（训练时使用）
-            reset_root: 搜索前是否重置 root（默认 True）。
+            reset_root: 搜索前是否重置 root（默认 False）。
                         True  — 每次搜索从空树开始，保证与当前局面匹配；
                         False — 保留上次子树统计（树复用模式），须配合
                                 update_with_move() 手动推进 root。
@@ -106,6 +106,12 @@ class MCTS:
         # 建立本次搜索的局面缓存（cache_size>0 时启用，减少重复网络推理）
         episode_cache = {} if self.cache_size > 0 else None
         self._cache_hits = 0
+
+        # 支持 num_simulations=0：不走树搜索，直接用策略头/价值头
+        if self.num_simulations <= 0:
+            return self._get_action_probs_no_mcts(
+                game=game, temperature=temperature, add_noise=add_noise
+            )
 
         # 运行模拟；第一次模拟后若需要则向 root 注入 Dirichlet 噪声
         for i in range(self.num_simulations):
@@ -142,6 +148,74 @@ class MCTS:
             self._print_root_stats(actions, visits)
 
         return actions, probs
+
+    def _get_action_probs_no_mcts(self, game, temperature=1.0, add_noise=False):
+        """
+        零搜索模式：直接使用网络策略头输出动作分布（带合法动作掩码）。
+        价值头会同时前向计算，作为局面评估信息（调试可见）。
+        """
+        legal_moves = game.get_legal_moves()
+        if not legal_moves:
+            return [], []
+
+        # MCTS内部动作统一使用“红方视角”坐标
+        if not game.red_to_move:
+            legal_moves = [flip_move(m) for m in legal_moves]
+
+        actions = [m for m in legal_moves if m in LABEL_TO_INDEX]
+        if not actions:
+            return [], []
+
+        legal_indices = [LABEL_TO_INDEX[m] for m in actions]
+        planes = game.to_planes()
+        policy, value = self.model.predict_with_mask(planes, legal_indices)
+
+        scores = np.array([policy[LABEL_TO_INDEX[a]] for a in actions],
+                          dtype=np.float64)
+
+        if add_noise and len(actions) > 1:
+            noise = np.random.dirichlet([self.dirichlet_alpha] * len(actions))
+            scores = (
+                (1.0 - self.dirichlet_weight) * scores
+                + self.dirichlet_weight * noise
+            )
+
+        probs = self._scores_to_probs(scores, temperature)
+
+        if self.debug_mcts:
+            top_idx = int(np.argmax(probs))
+            print(
+                f"[no-mcts] value={value:.4f}, legal={len(actions)}, "
+                f"best={actions[top_idx]}, p={probs[top_idx]:.4f}"
+            )
+
+        return actions, probs
+
+    @staticmethod
+    def _scores_to_probs(scores, temperature):
+        """将非负分数转换为概率分布（支持 temperature=0 的贪心模式）。"""
+        scores = np.asarray(scores, dtype=np.float64)
+        scores = np.clip(scores, 0.0, None)
+
+        if scores.size == 0:
+            return []
+
+        if temperature < 1e-8:
+            best_idx = int(np.argmax(scores))
+            probs = np.zeros_like(scores, dtype=np.float64)
+            probs[best_idx] = 1.0
+            return probs.tolist()
+
+        total = scores.sum()
+        if total <= 0:
+            return (np.ones_like(scores) / len(scores)).tolist()
+
+        scores_temp = scores ** (1.0 / temperature)
+        total_temp = scores_temp.sum()
+        if total_temp <= 0:
+            return (np.ones_like(scores) / len(scores)).tolist()
+
+        return (scores_temp / total_temp).tolist()
 
     def _add_dirichlet_noise(self, node):
         """向节点的子节点先验概率注入 Dirichlet 噪声（仅用于 root 节点）"""
