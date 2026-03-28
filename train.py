@@ -913,11 +913,7 @@ def compute_elo_update(r_current, r_opponent, score, k=32):
 
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
-<<<<<<< HEAD
                  buffer_size=50000, model_path=None, save_interval=50,
-=======
-                 buffer_size=10000, model_path=None, save_interval=50,
->>>>>>> a144424e8099ff5d2917bea50fa9ac95ce7c6150
                  quick=False,
                  eval_interval=0, eval_games=40, eval_simulations=50,
                  eval_opponent='previous', elo_k=32,
@@ -930,6 +926,8 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  my_side='alternate',
                  eval_gate=0.55,
                  engine_options=None,
+                 train_interval=10,           # 每多少局训练一次（默认10）
+                 train_recent_buffer=8000,    # 训练时使用最近N条数据（0=使用全部）
                  # 阶段 B：从蒸馏模型启动 / 放宽重复判和
                  init_from_distill=None,
                  repetition_draw_threshold=3,
@@ -1096,11 +1094,13 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
 
     data_buffer = deque(maxlen=buffer_size)
     stats = {'red_wins': 0, 'black_wins': 0, 'draws': 0}
-
+    games_since_last_train = 0
     print(f"\n{'='*60}")
     print(f"开始训练")
     print(f"总对局数: {num_games}")
     print(f"MCTS模拟次数: {num_simulations}")
+    print(f"训练频率: 每 {train_interval} 局训练一次")
+    print(f"训练数据: {'使用最近 ' + str(train_recent_buffer) + ' 条数据' if train_recent_buffer > 0 else '使用全部缓冲区数据'}")
     print(f"模型保存路径: {model_path}")
     if use_opponent_pool:
         print(f"对手池模式: 启用（引擎: {engine_path}，课程: {curriculum}，"
@@ -1223,6 +1223,7 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
 
             if kept_for_training:
                 data_buffer.extend(data)
+                games_since_last_train += 1
 
             if winner == 'red':
                 stats['red_wins'] += 1
@@ -1269,23 +1270,62 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 print(f"  [和棋过滤汇总 @{game_idx}局] "
                       f"draw总数={total_draws}, 进入buffer={total_kept} | "
                       f"{draw_filter.summary_str()}")
-
+            should_train = False
+            train_data = None
             avg_loss = 0.0
-            if len(data_buffer) >= batch_size:
-                train_data = list(data_buffer)
+            # 条件1: 缓冲区数据足够
+            buffer_ready = len(data_buffer) >= batch_size
+            
+            # 条件2: 达到训练间隔（如果train_interval > 0）
+            interval_ready = (train_interval > 0 and games_since_last_train >= train_interval)
+            
+            # 条件3: 强制训练条件（可选：buffer快满时强制训练）
+            force_train = (len(data_buffer) >= buffer_size and games_since_last_train >= 1)
+            
+            if buffer_ready and (interval_ready or force_train):
+                # 决定使用哪些数据进行训练
+                if train_recent_buffer > 0:
+                    # 只使用最近的数据
+                    recent_count = min(train_recent_buffer, len(data_buffer))
+                    train_data = list(data_buffer)[-recent_count:]
+                    print(f"  ▶ 开始训练（使用最近 {recent_count} 条数据，"
+                          f"缓冲区共 {len(data_buffer)} 条，距上次训练 {games_since_last_train} 局）")
+                else:
+                    # 使用全部缓冲区数据
+                    train_data = list(data_buffer)
+                    print(f"  ▶ 开始训练（使用全部 {len(data_buffer)} 条数据，"
+                          f"距上次训练 {games_since_last_train} 局）")
+                
+                # 执行训练
                 avg_loss = train_model(
-                    model, train_data, batch_size=batch_size,
-                    epochs=num_epochs, lr=lr
+                    model, train_data,
+                    batch_size=batch_size,
+                    epochs=num_epochs,
+                    lr=lr
                 )
-                print(f"  训练完成，平均损失: {avg_loss:.4f}")
-
+                print(f"  ✓ 训练完成，平均损失: {avg_loss:.4f}")
+                
+                # 重置训练计数器
+                games_since_last_train = 0
+                
+                # 记录训练日志
                 append_training_csv(run_dir, {
                     'game_idx': game_idx,
                     'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
                     'loss': round(avg_loss, 6),
                     'buffer_size': len(data_buffer),
-                    'elapsed_s': round(elapsed, 2),
+                    'train_data_size': len(train_data),
+                    'games_since_last_train': games_since_last_train,
+                    'elapsed_s': round(time.time() - start_time, 2),
                 })
+            else:
+                # 显示训练等待信息
+                if len(data_buffer) >= batch_size:
+                    remaining = train_interval - games_since_last_train if train_interval > 0 else 0
+                    print(f"  距下次训练还有 {remaining} 局 (buffer={len(data_buffer)}, "
+                          f"batch={batch_size}, 最近训练间隔={train_interval})")
+                else:
+                    print(f"  等待数据积累... ({len(data_buffer)}/{batch_size})")
 
             if game_idx % save_interval == 0:
                 # === 修改：增量保存 model_{idx}.pth ===
