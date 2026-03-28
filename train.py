@@ -720,8 +720,15 @@ def _run_parallel_training(
 
             # ── 定期保存 + 通知推理服务重载 ──────────────────────────────────
             if games_collected % save_interval == 0:
-                model.save(model_path)
-                print(f"  模型已保存到: {model_path}")
+                # === 修改：增量保存 model_{idx}.pth ===
+                model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
+                incremental_path = os.path.join(model_dir, f"model_{games_collected}.pth")
+                model.save(incremental_path)
+                print(f"  模型已增量保存到: {incremental_path}")
+                
+                # 同时更新主路径模型，供推理服务重载
+                model.save(model_path) 
+                
                 try:
                     model_update_q.put_nowait(RELOAD_MODEL_MSG)
                 except Exception:
@@ -906,7 +913,7 @@ def compute_elo_update(r_current, r_opponent, score, k=32):
 
 def run_training(num_games=50, num_simulations=100, num_epochs=5,
                  batch_size=256, lr=0.001, max_moves=200,
-                 buffer_size=10000, model_path=None, save_interval=10,
+                 buffer_size=50000, model_path=None, save_interval=50,
                  quick=False,
                  eval_interval=0, eval_games=40, eval_simulations=50,
                  eval_opponent='previous', elo_k=32,
@@ -1277,11 +1284,18 @@ def run_training(num_games=50, num_simulations=100, num_epochs=5,
                 })
 
             if game_idx % save_interval == 0:
-                model.save(model_path)
-                print(f"  模型已保存到: {model_path}")
+                # === 修改：增量保存 model_{idx}.pth ===
+                model_dir = os.path.dirname(model_path) if os.path.dirname(model_path) else '.'
+                incremental_path = os.path.join(model_dir, f"model_{game_idx}.pth")
+                model.save(incremental_path)
+                print(f"  模型已增量保存到: {incremental_path}")
+                
+                # 同时保存一份 latest (可选，方便读取)
+                model.save(model_path) 
+                
                 # 将 checkpoint 加入历史池（对手池模式）
                 if pool is not None:
-                    pool.add_checkpoint(model_path)
+                    pool.add_checkpoint(incremental_path)
 
             # 定期评测
             if eval_interval > 0 and game_idx % eval_interval == 0:

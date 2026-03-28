@@ -605,8 +605,8 @@ def run_distill(
     value_loss_weight: float = 0.0,
     buffer_size: int = 20000,
     save_interval: int = 20,
-    self_eval_games: int = 20,
-    self_eval_num_simulations: int = 50,
+    train_interval: int = 10,        # ★ 新增：每N局训练一次
+    train_window_size: int = 8000,   # ★ 新增：每次训练只用最近N条
     engine_options: dict = None,
     teacher_engine_path: str = None,
     teacher_options: dict = None,
@@ -642,8 +642,6 @@ def run_distill(
         value_loss_weight:        价值损失权重（蒸馏阶段建议 0.0；默认 0.0）。
         buffer_size:              训练数据缓冲区大小（默认 20000）。
         save_interval:            每隔多少局保存一次模型（默认 20）。
-        self_eval_games:          每次增量保存后，与上一个快照自博弈评测局数（默认 20）。
-        self_eval_num_simulations: 自博弈评测每步 MCTS 模拟次数（默认 50）。
         engine_options:           传给弱引擎的选项字典（如 ``{"UCI_Elo": "1500"}``）。
         teacher_engine_path:      强引擎路径；若为 ``None`` 则复用弱引擎（unified 模式）。
         teacher_options:          传给强引擎的选项字典。
@@ -720,86 +718,6 @@ def run_distill(
     def _run_games(weak_agent, teacher_agent):
         previous_model_path = None
 
-        def _run_self_eval(current_path: str, previous_path: str):
-            """当前增量模型与上一个增量模型做自博弈评测，并落盘 CSV。"""
-            current_model = ChessModel(num_channels=256, num_res_blocks=16)
-            previous_model = ChessModel(num_channels=256, num_res_blocks=16)
-            current_model.load(current_path)
-            previous_model.load(previous_path)
-
-            wins_current = 0
-            losses_current = 0
-            draws = 0
-            total_moves = 0
-
-            for eval_game_idx in range(self_eval_games):
-                if eval_game_idx % 2 == 0:
-                    red_model = current_model
-                    black_model = previous_model
-                    current_is_red = True
-                else:
-                    red_model = previous_model
-                    black_model = current_model
-                    current_is_red = False
-
-                game = ChessGame()
-                game.reset()
-                red_mcts = MCTS(red_model, num_simulations=self_eval_num_simulations)
-                black_mcts = MCTS(black_model, num_simulations=self_eval_num_simulations)
-
-                move_count = 0
-                while not game.done and move_count < max_moves:
-                    mcts = red_mcts if game.red_to_move else black_mcts
-                    actions, probs = mcts.get_action_probs(
-                        game, temperature=0.0, add_noise=False
-                    )
-                    if not actions:
-                        break
-
-                    chosen_action = actions[int(np.argmax(probs))]
-                    actual_action = chosen_action if game.red_to_move else flip_move(chosen_action)
-                    game.step(actual_action)
-                    mcts.update_with_move(chosen_action)
-                    move_count += 1
-
-                winner = game.winner
-                total_moves += move_count
-                if winner == 'draw' or winner is None:
-                    draws += 1
-                elif (winner == 'red' and current_is_red) or (
-                    winner == 'black' and not current_is_red
-                ):
-                    wins_current += 1
-                else:
-                    losses_current += 1
-
-            avg_moves = total_moves / max(self_eval_games, 1)
-            row = {
-                'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
-                'game_idx': game_idx,
-                'current_model': os.path.basename(current_path),
-                'previous_model': os.path.basename(previous_path),
-                'n_games': self_eval_games,
-                'wins': wins_current,
-                'losses': losses_current,
-                'draws': draws,
-                'avg_moves': round(avg_moves, 3),
-                'num_simulations': self_eval_num_simulations,
-            }
-            file_exists = os.path.exists(self_play_history_csv)
-            with open(self_play_history_csv, 'a', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-                if not file_exists:
-                    writer.writeheader()
-                writer.writerow(row)
-
-            print(
-                f"  自博弈评测完成: {os.path.basename(current_path)} vs "
-                f"{os.path.basename(previous_path)} | "
-                f"W/L/D={wins_current}/{losses_current}/{draws}, "
-                f"avg_moves={avg_moves:.2f}"
-            )
-
         for game_idx in range(1, n_games + 1):
             start_time = time.time()
 
@@ -840,13 +758,14 @@ def run_distill(
 
             elapsed = time.time() - start_time
             print(f"[蒸馏 {game_idx}/{n_games}] "
-                  f"步数: {moves}, "
-                  f"原因: {terminate_reason or '-'}, "
-                  f"样本: {effective_samples}, "
-                  f"缓冲区: {len(data_buffer)}, "
-                  f"teacher_ratio: {teacher_move_ratio:.2f}, "
-                  f"耗时: {elapsed:.1f}s")
+                f"步数: {moves}, "
+                f"原因: {terminate_reason or '-'}, "
+                f"样本: {effective_samples}, "
+                f"缓冲区: {len(data_buffer)}, "
+                f"teacher_ratio: {teacher_move_ratio:.2f}, "
+                f"耗时: {elapsed:.1f}s")
 
+            # 每局都记录 self_play 日志
             jsonl_record = {
                 'game_idx': game_idx,
                 'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -856,7 +775,6 @@ def run_distill(
                 'num_samples': effective_samples,
                 'elapsed_s': round(elapsed, 2),
                 'mode': 'distill',
-                # 新增可观测性字段
                 'trajectory_source_mode': trajectory_source,
                 'teacher_move_ratio': round(teacher_move_ratio, 4),
                 'soft_policy_entropy_mean': round(entropy_mean, 4),
@@ -867,45 +785,157 @@ def run_distill(
             }
             append_self_play_jsonl(run_dir, jsonl_record)
 
+            # ------------------------------------------------------------------
+            # 训练判断：buffer够大 且 到达训练间隔
+            # ------------------------------------------------------------------
             avg_policy_loss = 0.0
             avg_value_loss = 0.0
-            if len(data_buffer) >= batch_size:
+            trained = False
+
+            should_train = (
+                len(data_buffer) >= batch_size
+                and game_idx % train_interval == 0
+            )
+
+            if should_train:
+                # 取最近 train_window_size 条数据
+                recent_data = list(data_buffer)[-train_window_size:]
+
+                print(f"  ▶ 开始训练（使用 {len(recent_data)} 条数据）...")
+
                 avg_policy_loss, avg_value_loss = distill_model(
-                    model, list(data_buffer),
+                    model, recent_data,
                     batch_size=batch_size,
                     epochs=epochs,
                     lr=lr,
                     value_loss_weight=value_loss_weight,
                 )
-                print(f"  蒸馏训练完成，平均策略损失: {avg_policy_loss:.4f}，平均价值损失: {avg_value_loss:.4f}")
+                trained = True
 
-                append_training_csv(run_dir, {
+                print(f"  ✓ 训练完成，策略损失: {avg_policy_loss:.4f}，"
+                    f"价值损失: {avg_value_loss:.4f}")
+
+                # ------------------------------------------------------------------
+                # 策略坍塌检测：只在训练后执行，从训练数据中采样
+                # ------------------------------------------------------------------
+                sample_n = min(100, len(recent_data))
+                sample_indices = random.sample(range(len(recent_data)), sample_n)
+                sample_policies = [recent_data[i][1] for i in sample_indices]
+
+                top1_probs = []
+                entropies = []
+                policy_diversity = []
+
+                for policy in sample_policies:
+                    top1 = float(np.max(policy))
+                    top1_probs.append(top1)
+
+                    non_zero = policy[policy > 0]
+                    if len(non_zero) > 0:
+                        entropy = float(-np.sum(non_zero * np.log(non_zero)))
+                        entropies.append(entropy)
+                        if entropy > 0:
+                            policy_diversity.append(np.exp(entropy))
+
+                avg_top1 = np.mean(top1_probs) if top1_probs else 0.0
+                avg_entropy = np.mean(entropies) if entropies else 0.0
+                avg_effective_actions = np.mean(policy_diversity) if policy_diversity else 0.0
+
+                # 坍塌检测阈值
+                COLLAPSE_ENTROPY_THRESHOLD = 0.5
+                COLLAPSE_TOP1_THRESHOLD = 0.85
+                COLLAPSE_EFFECTIVE_ACTIONS = 1.5
+
+                collapse_warnings = []
+                if avg_entropy < COLLAPSE_ENTROPY_THRESHOLD:
+                    collapse_warnings.append(
+                        f"策略熵过低 ({avg_entropy:.3f} < {COLLAPSE_ENTROPY_THRESHOLD})")
+                if avg_top1 > COLLAPSE_TOP1_THRESHOLD:
+                    collapse_warnings.append(
+                        f"Top1概率过高 ({avg_top1:.3f} > {COLLAPSE_TOP1_THRESHOLD})")
+                if avg_effective_actions < COLLAPSE_EFFECTIVE_ACTIONS:
+                    collapse_warnings.append(
+                        f"有效动作数过少 ({avg_effective_actions:.2f} < {COLLAPSE_EFFECTIVE_ACTIONS})")
+
+                # 输出策略质量报告
+                print(f"  📊 策略质量报告:")
+                print(f"     平均 Top1 概率: {avg_top1:.4f}")
+                print(f"     平均策略熵: {avg_entropy:.4f}")
+                print(f"     平均有效动作数: {avg_effective_actions:.2f} / {NUM_ACTIONS}")
+                print(f"     策略分布: min={np.min(top1_probs):.4f}, "
+                    f"max={np.max(top1_probs):.4f}, "
+                    f"std={np.std(top1_probs):.4f}")
+
+                if collapse_warnings:
+                    print(f"  🚨 策略坍塌警告:")
+                    for warning in collapse_warnings:
+                        print(f"     {warning}")
+
+                    extreme_idx = int(np.argmax(top1_probs))
+                    extreme_policy = sample_policies[extreme_idx]
+                    top_moves = np.argsort(extreme_policy)[-5:][::-1]
+                    top_probs_values = extreme_policy[top_moves]
+
+                    print(f"  🔍 最极端样本 (Top1={top1_probs[extreme_idx]:.4f}):")
+                    for i, (move_idx, prob) in enumerate(zip(top_moves, top_probs_values)):
+                        print(f"     动作{i + 1}: idx={move_idx}, prob={prob:.4f}")
+                else:
+                    print(f"  ✅ 策略质量良好，未检测到坍塌迹象")
+
+                # 记录坍塌检测结果
+                collapse_record = {
                     'game_idx': game_idx,
                     'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
-                    'policy_loss': round(avg_policy_loss, 6),
-                    'value_loss': round(avg_value_loss, 6),
-                    'buffer_size': len(data_buffer),
-                    'elapsed_s': round(elapsed, 2),
-                    'mode': 'distill',
-                    # 新增可观测性字段
-                    'trajectory_source_mode': trajectory_source,
-                    'teacher_move_ratio': round(teacher_move_ratio, 4),
-                    'soft_policy_entropy_mean': round(entropy_mean, 4),
-                    'soft_policy_low_quality_ratio': round(low_q_ratio, 4),
-                    'value_mode': distill_value_mode,
-                    'effective_samples': effective_samples,
-                    'skip_sample_count': skip_count,
-                })
+                    'avg_top1_prob': round(avg_top1, 6),
+                    'avg_entropy': round(avg_entropy, 6),
+                    'avg_effective_actions': round(avg_effective_actions, 2),
+                    'min_top1_prob': round(float(np.min(top1_probs)), 6),
+                    'max_top1_prob': round(float(np.max(top1_probs)), 6),
+                    'std_top1_prob': round(float(np.std(top1_probs)), 6),
+                    'has_collapse': len(collapse_warnings) > 0,
+                    'collapse_warnings': '; '.join(collapse_warnings) if collapse_warnings else 'None',
+                }
+                append_training_csv(run_dir, collapse_record, mode='collapse_detection')
 
+            else:
+                # 未训练时简要提示
+                if len(data_buffer) < batch_size:
+                    print(f"  等待数据积累... ({len(data_buffer)}/{batch_size})")
+                else:
+                    next_train = ((game_idx // train_interval) + 1) * train_interval
+                    remaining = next_train - game_idx
+                    print(f"  距下次训练还有 {remaining} 局 "
+                        f"(buffer={len(data_buffer)}, window={train_window_size})")
+
+            # 每局都记录训练日志（未训练时 loss=0, trained=False）
+            append_training_csv(run_dir, {
+                'game_idx': game_idx,
+                'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
+                'policy_loss': round(avg_policy_loss, 6),
+                'value_loss': round(avg_value_loss, 6),
+                'buffer_size': len(data_buffer),
+                'trained': trained,
+                'train_window': train_window_size if trained else 0,
+                'elapsed_s': round(elapsed, 2),
+                'mode': 'distill',
+                'trajectory_source_mode': trajectory_source,
+                'teacher_move_ratio': round(teacher_move_ratio, 4),
+                'soft_policy_entropy_mean': round(entropy_mean, 4),
+                'soft_policy_low_quality_ratio': round(low_q_ratio, 4),
+                'value_mode': distill_value_mode,
+                'effective_samples': effective_samples,
+                'skip_sample_count': skip_count,
+            })
+
+            # 定期保存模型
             if game_idx % save_interval == 0:
                 incremental_model_path = os.path.join(
                     out_dir, f"model_distill_{game_idx}.pth"
                 )
                 model.save(incremental_model_path)
-                print(f"  蒸馏模型已增量保存到: {incremental_model_path}")
-                if previous_model_path and self_eval_games > 0:
-                    _run_self_eval(incremental_model_path, previous_model_path)
+                print(f"  模型已保存: {incremental_model_path}")
                 previous_model_path = incremental_model_path
+
 
     use_separate_teacher = (
         teacher_engine_path is not None
@@ -1012,10 +1042,6 @@ def main():
                         help='训练数据缓冲区大小 (默认: 20000)')
     parser.add_argument('--save_interval', type=int, default=20,
                         help='每隔多少局保存一次模型 (默认: 20)')
-    parser.add_argument('--self_eval_games', type=int, default=20,
-                        help='每次增量保存后，与上一快照自博弈评测局数（0=禁用，默认: 20）')
-    parser.add_argument('--self_eval_num_simulations', type=int, default=50,
-                        help='自博弈评测每步 MCTS 模拟次数（默认: 50）')
 
     # 【原有参数】支持 Elo 控制
     parser.add_argument('--engine_elo', type=int, default=None,
@@ -1096,8 +1122,6 @@ def main():
         value_loss_weight=args.value_loss_weight,
         buffer_size=args.buffer_size,
         save_interval=args.save_interval,
-        self_eval_games=args.self_eval_games,
-        self_eval_num_simulations=args.self_eval_num_simulations,
         teacher_engine_path=args.teacher_engine_path,
         multipv_k=args.multipv_k,
         teacher_temperature=args.teacher_temperature,

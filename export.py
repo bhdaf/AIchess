@@ -76,24 +76,29 @@ def append_self_play_jsonl(run_dir, record):
         traceback.print_exc()
 
 
-def append_training_csv(run_dir, row):
-    """
-    将训练指标一行追加写入 ``training_metrics.csv``。
+# 在 export.py 中添加或修改
 
-    Args:
-        run_dir (str): 运行目录路径。
-        row (dict): 指标字典，字段名作为 CSV 列名。
+def append_training_csv(run_dir: str, record: dict, mode: str = 'training'):
     """
-    path = os.path.join(run_dir, 'training_metrics.csv')
-    write_header = not os.path.exists(path)
-    try:
-        with open(path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row)
-    except OSError:
-        traceback.print_exc()
+    添加训练记录到 CSV。
+    
+    Args:
+        run_dir: 运行目录
+        record: 记录字典
+        mode: 记录模式 ('training', 'collapse_detection', 'self_play')
+    """
+    csv_path = os.path.join(run_dir, f'{mode}_history.csv')
+    
+    # 确保目录存在
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # 写入CSV
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(record.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(record)
 
 
 def append_evaluation_csv(run_dir, row):
