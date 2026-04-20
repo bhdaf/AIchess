@@ -111,10 +111,10 @@ python -m AIchess train \
 
 2. 放置目录（推荐）  
    在仓库里新建统一目录，便于后续命令复用路径：
-   （下文 `REPO_ROOT` 表示仓库父目录，例如 `/home/runner/work/AIchess`）
+   （下文 `PROJECT_DIR` 表示仓库目录，例如 `/path/to/AIchess`）
 
    ```text
-   ${REPO_ROOT}/AIchess/engines/
+   ${PROJECT_DIR}/engines/
    ├── pikafish_weak/      # 可选
    │   └── pikafish
    └── pikafish_strong/    # 可选
@@ -123,13 +123,13 @@ python -m AIchess train \
 
 3. Linux/macOS 赋予执行权限  
    ```bash
-   chmod +x ${REPO_ROOT}/AIchess/engines/pikafish_weak/pikafish
-   chmod +x ${REPO_ROOT}/AIchess/engines/pikafish_strong/pikafish
+   chmod +x ${PROJECT_DIR}/engines/pikafish_weak/pikafish
+   chmod +x ${PROJECT_DIR}/engines/pikafish_strong/pikafish
    ```
 
 4. 先做可执行性自检（可选但推荐）  
    ```bash
-   ${REPO_ROOT}/AIchess/engines/pikafish_weak/pikafish
+   ${PROJECT_DIR}/engines/pikafish_weak/pikafish
    ```
    能启动并显示引擎信息即可（退出可用 `quit` 或 `Ctrl+C`）。
 
@@ -143,7 +143,7 @@ python -m AIchess train \
 
 ```bash
 python -m AIchess distill \
-  --engine_path ${REPO_ROOT}/AIchess/engines/pikafish_weak/pikafish \
+  --engine_path ${PROJECT_DIR}/engines/pikafish_weak/pikafish \
   --out_model AIchess/saved_model/model_distill.pth \
   --n_games 200 \
   --multipv_k 5
@@ -153,8 +153,8 @@ python -m AIchess distill \
 
 ```bash
 python -m AIchess distill \
-  --engine_path ${REPO_ROOT}/AIchess/engines/pikafish_weak/pikafish \
-  --teacher_engine_path ${REPO_ROOT}/AIchess/engines/pikafish_strong/pikafish \
+  --engine_path ${PROJECT_DIR}/engines/pikafish_weak/pikafish \
+  --teacher_engine_path ${PROJECT_DIR}/engines/pikafish_strong/pikafish \
   --out_model AIchess/saved_model/model_distill.pth \
   --n_games 200 \
   --multipv_k 5
