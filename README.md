@@ -101,6 +101,64 @@ python -m AIchess train \
 
 ## 4.2 蒸馏（Distill）
 
+### 先准备 Pikafish（下载、放置、可执行）
+
+1. 下载引擎  
+   - 到 **Pikafish 官方发布页（Releases）** 下载与你系统匹配的可执行文件（Windows/Linux/macOS）。
+   - 你可以准备：
+     - 一个引擎（弱/强都用同一个）；
+     - 或两个引擎（分别作为 weak / teacher）。
+
+2. 放置目录（推荐）  
+   在仓库里新建统一目录，便于后续命令复用路径：
+
+   ```text
+   /home/runner/work/AIchess/AIchess/engines/
+   ├── pikafish_weak/      # 可选
+   │   └── pikafish
+   └── pikafish_strong/    # 可选
+       └── pikafish
+   ```
+
+3. Linux/macOS 赋予执行权限  
+   ```bash
+   chmod +x /home/runner/work/AIchess/AIchess/engines/pikafish_weak/pikafish
+   chmod +x /home/runner/work/AIchess/AIchess/engines/pikafish_strong/pikafish
+   ```
+
+4. 先做可执行性自检（可选但推荐）  
+   ```bash
+   /home/runner/work/AIchess/AIchess/engines/pikafish_weak/pikafish
+   ```
+   能启动并显示引擎信息即可（退出可用 `quit` 或 `Ctrl+C`）。
+
+### 如何在蒸馏中使用 Pikafish
+
+- `--engine_path`：必填，弱引擎路径（负责实际走子）。
+- `--teacher_engine_path`：可选，强引擎路径（提供 teacher soft target）。
+  - 不填时默认复用 `--engine_path`（单引擎模式）。
+
+**单引擎模式（最简）：**
+
+```bash
+python -m AIchess distill \
+  --engine_path /home/runner/work/AIchess/AIchess/engines/pikafish_weak/pikafish \
+  --out_model AIchess/saved_model/model_distill.pth \
+  --n_games 200 \
+  --multipv_k 5
+```
+
+**双引擎模式（弱引擎走子 + 强引擎指导）：**
+
+```bash
+python -m AIchess distill \
+  --engine_path /home/runner/work/AIchess/AIchess/engines/pikafish_weak/pikafish \
+  --teacher_engine_path /home/runner/work/AIchess/AIchess/engines/pikafish_strong/pikafish \
+  --out_model AIchess/saved_model/model_distill.pth \
+  --n_games 200 \
+  --multipv_k 5
+```
+
 ```bash
 python -m AIchess distill \
   --engine_path /path/to/pikafish_weak \
@@ -226,4 +284,3 @@ python -m AIchess.tests
 
 2. **无法使用引擎相关命令**
    - 检查 `--engine_path` 是否可执行、UCI 引擎是否可正常启动。
-
