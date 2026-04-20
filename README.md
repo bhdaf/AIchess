@@ -224,9 +224,6 @@ python -m AIchess.tests
    - 原因：在 `AIchess` 目录内直接运行模块。
    - 解决：切到父目录 `/home/runner/work/AIchess` 再执行 `python -m AIchess ...`。
 
-2. **缺少 `numpy/torch/pygame/matplotlib`**
-   - 先安装依赖：`pip install numpy torch pygame matplotlib`。
-
-3. **无法使用引擎相关命令**
+2. **无法使用引擎相关命令**
    - 检查 `--engine_path` 是否可执行、UCI 引擎是否可正常启动。
 
