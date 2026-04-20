@@ -121,6 +121,11 @@ python -m AIchess train \
        └── pikafish
    ```
 
+   执行命令前可先设置变量：
+   ```bash
+   PROJECT_DIR=/path/to/AIchess
+   ```
+
 3. Linux/macOS 赋予执行权限  
    ```bash
    chmod +x ${PROJECT_DIR}/engines/pikafish_weak/pikafish
