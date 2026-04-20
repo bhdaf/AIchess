@@ -105,14 +105,14 @@ python -m AIchess train \
 
 1. 下载引擎  
    - 到 **Pikafish 官方发布页（Releases）** 下载与你系统匹配的可执行文件（Windows/Linux/macOS）。
-     - https://github.com/official-pikafish/Pikafish/releases
+     - [Pikafish Releases](https://github.com/official-pikafish/Pikafish/releases)
    - 你可以准备：
      - 一个引擎（弱/强都用同一个）；
      - 或两个引擎（分别作为 weak / teacher）。
 
 2. 放置目录（推荐）  
    在仓库里新建统一目录，便于后续命令复用路径：
-   （下文 `PROJECT_DIR` 表示仓库目录，例如 `/path/to/your-AIchess-repo`）
+   （下文 `PROJECT_DIR` 表示仓库目录，例如 `/path/to/repository`）
 
    ```text
    ${PROJECT_DIR}/engines/
@@ -124,7 +124,7 @@ python -m AIchess train \
 
    执行命令前可先设置变量：
    ```bash
-   PROJECT_DIR=/path/to/your-AIchess-repo
+   PROJECT_DIR=/path/to/repository
    ```
 
 3. Linux/macOS 赋予执行权限  
